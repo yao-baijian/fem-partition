@@ -400,7 +400,8 @@ if 'p' in locals():
     # p is of shape (1, n, q) representing permutations
     J = case_bmincut.problem.coupling_matrix
     n = J.shape[0]
-    counts = p[0].sum(dim=0).cpu().numpy()
+    final_assignment = p[0].argmax(dim=1).cpu().numpy()
+    counts = np.bincount(final_assignment, minlength=q)
     ideal = n / q
     imbalance = float(np.max(np.abs(counts - ideal) / ideal))
     print(f"Max Imbalance for method '{partition_method}': {imbalance:.4f}")

@@ -243,7 +243,10 @@ else:
     final_assignment = initial_assignment
 
 # 4. Final Output & Evaluation
-fem_cut_value, max_imbalance = evaluate_kahypar_cut_value(final_assignment, hyperedges, [1.0] * len(hyperedges))
+fem_cut_value, _ = evaluate_kahypar_cut_value(final_assignment, hyperedges, [1.0] * len(hyperedges))
+counts = np.bincount(final_assignment, minlength=q_ways)
+ideal = num_nodes / q_ways
+max_imbalance = float(np.max(np.abs(counts - ideal) / ideal))
 
 print(f'\n--- Final Results ---')
 print(f'Instance: {instance}')
