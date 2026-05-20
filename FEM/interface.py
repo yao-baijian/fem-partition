@@ -12,7 +12,7 @@ class FEM:
         pass
 
     @classmethod
-    def from_file(cls, problem_type, filename, fpga_wrapper, index_start=0, epsilon=0.03, q=2, hyperedges=None, map_type='normal',**args):
+    def from_file(cls, problem_type, filename, index_start=0, epsilon=0.03, q=2, hyperedges=None, map_type='normal',**args):
             num_nodes, num_interactions, couplings = parse_file(
                 problem_type, filename, index_start, map_type
             )
