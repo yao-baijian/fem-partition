@@ -14,7 +14,7 @@ except ImportError:
     warnings.warn("pymetis is not installed. METIS mode will fail.")
 
 num_trials = 1
-num_steps = 100
+num_steps = 400
 dev = 'cpu'
 
 # ==========================================
@@ -27,13 +27,13 @@ dev = 'cpu'
 # 'kahypar'                   : KaHyPar partitioner alone
 # 'kaffpa'                    : KaFFPa partitioner alone
 # ==========================================
-partition_method = 'metis'
+partition_method = 'coarse_fem_refine_kaffpa'
 
 # normal graph instances
-instance = 'tests/test_instances/karate.txt'
+instance = 'tests/test_instances/G1.txt'
 # instance = '../partition/data/ash219/ash219.mtx'
 case_type = 'bmincut'
-q = 2  # Number of partitions
+q = 4  # Number of partitions
 
 print(f"Loading {instance}...")
 # Use FEM parser to easily load the normal graph
@@ -103,7 +103,7 @@ elif partition_method == 'coarse_fem_refine_metis':
     print("====== Running Coarse FEM + METIS Refinement ======")
     start_time = time.time()
     
-    from utils import coarsen_graph_by_leaf_folding, expand_coarse_labels
+    from utils import coarsen_graph_by_matching, expand_coarse_labels
     J = case_bmincut.problem.coupling_matrix
     if not J.is_sparse:
         J = J.to_sparse()
@@ -111,11 +111,10 @@ elif partition_method == 'coarse_fem_refine_metis':
     n = J.shape[0]
     
     # 1. Multi-level coarsening
-    coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_leaf_folding(
+    coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_matching(
         J,
         node_weights=torch.ones(n, dtype=torch.float32),
-        max_degree=500,
-        min_nodes=5000,
+        coarsen_to=500,
     )
     
     num_coarse_nodes = coarse_graph.shape[0]
@@ -175,15 +174,15 @@ elif partition_method == 'coarse_fem_refine_kahypar':
     print("====== Running Coarse FEM + KaHyPar Refinement ======")
     start_time = time.time()
     
-    from utils import coarsen_graph_by_leaf_folding, expand_coarse_labels
+    from utils import coarsen_graph_by_matching, expand_coarse_labels
     J = case_bmincut.problem.coupling_matrix
     if not J.is_sparse:
         J = J.to_sparse()
     J = J.coalesce()
     n = J.shape[0]
     
-    coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_leaf_folding(
-        J, node_weights=torch.ones(n, dtype=torch.float32), max_degree=500, min_nodes=5000
+    coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_matching(
+        J, node_weights=torch.ones(n, dtype=torch.float32), coarsen_to=500
     )
     num_coarse_nodes = coarse_graph.shape[0]
     
@@ -245,15 +244,15 @@ elif partition_method == 'coarse_fem_refine_kaffpa':
     print("====== Running Coarse FEM + KaFFPa Refinement ======")
     start_time = time.time()
     
-    from utils import coarsen_graph_by_leaf_folding, expand_coarse_labels
+    from utils import coarsen_graph_by_matching, expand_coarse_labels
     J = case_bmincut.problem.coupling_matrix
     if not J.is_sparse:
         J = J.to_sparse()
     J = J.coalesce()
     n = J.shape[0]
     
-    coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_leaf_folding(
-        J, node_weights=torch.ones(n, dtype=torch.float32), max_degree=500, min_nodes=5000
+    coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_matching(
+        J, node_weights=torch.ones(n, dtype=torch.float32), coarsen_to=500
     )
     num_coarse_nodes = coarse_graph.shape[0]
     
@@ -393,3 +392,15 @@ elif partition_method == 'kaffpa':
 
 else:
     raise ValueError(f"Unknown partition method: {partition_method}")
+
+if 'p' not in locals() and 'best_config' in locals():
+    p = best_config.unsqueeze(0)
+
+if 'p' in locals():
+    # p is of shape (1, n, q) representing permutations
+    J = case_bmincut.problem.coupling_matrix
+    n = J.shape[0]
+    counts = p[0].sum(dim=0).cpu().numpy()
+    ideal = n / q
+    imbalance = float(np.max(np.abs(counts - ideal) / ideal))
+    print(f"Max Imbalance for method '{partition_method}': {imbalance:.4f}")

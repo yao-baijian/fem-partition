@@ -57,8 +57,8 @@ def evaluate_kahypar_cut_value(assignment: np.ndarray, hyperedges: list, hypered
     counts = np.bincount(arr, minlength=q)
     ideal = arr.size / float(q)
     imbalance_per_group = np.abs(counts - ideal) / ideal
-    avg_imbalance = float(np.mean(imbalance_per_group))
-    return total_cut_value, avg_imbalance
+    max_imbalance = float(np.max(imbalance_per_group))
+    return total_cut_value, max_imbalance
 
 
 def build_clique_expanded_graph(hyperedges: list, num_nodes: int = None, normalize_weight: bool = True):
@@ -101,92 +101,96 @@ def _sparse_to_adjacency_dict(J: torch.Tensor):
     return adjacency
 
 
-def coarsen_graph_by_leaf_folding(J: torch.Tensor, node_weights=None, max_degree: int = 500, min_nodes: int = 5000, max_rounds: int = 1000):
+def coarsen_graph_by_matching(J: torch.Tensor, node_weights=None, max_node_weight=None, coarsen_to: int = 500, max_rounds: int = 20):
     if not J.is_sparse:
         J = J.to_sparse()
-
-    adjacency = _sparse_to_adjacency_dict(J)
+    J = J.coalesce()
     n = J.shape[0]
-    active_nodes = set(range(n))
-    groups = {node: [node] for node in range(n)}
+    
+    groups = [[node] for node in range(n)]
     if node_weights is None:
-        weights = {node: 1.0 for node in range(n)}
+        weights = np.ones(n, dtype=np.float32)
     else:
-        weights = {node: float(node_weights[node]) for node in range(n)}
-
-    def merge_leaf(leaf, neighbor):
-        if leaf not in active_nodes or neighbor not in active_nodes:
-            return False
-        leaf_neighbors = list(adjacency[leaf].items())
-        if len(leaf_neighbors) != 1:
-            return False
-
-        for other, edge_weight in leaf_neighbors:
-            if other == neighbor:
-                continue
-            adjacency[neighbor][other] = adjacency[neighbor].get(other, 0.0) + edge_weight
-            adjacency[other][neighbor] = adjacency[other].get(neighbor, 0.0) + edge_weight
-            adjacency[other].pop(leaf, None)
-
-        adjacency[neighbor].pop(leaf, None)
-        adjacency[leaf].clear()
-        active_nodes.remove(leaf)
-        weights[neighbor] += weights[leaf]
-        groups[neighbor].extend(groups[leaf])
-        groups.pop(leaf, None)
-        weights.pop(leaf, None)
-        return True
-
+        weights = np.array(node_weights, dtype=np.float32)
+        
+    if max_node_weight is None:
+        max_node_weight = max(weights.sum() / 50.0, np.max(weights) * 2)
+        
+    current_J = J
+    current_n = n
+    current_weights = weights
+    
     for _ in range(max_rounds):
-        current_max_degree = max((len(adjacency[node]) for node in active_nodes), default=0)
-        if current_max_degree < max_degree or len(active_nodes) <= min_nodes:
+        if current_n <= coarsen_to:
             break
-
-        leaves = [node for node in list(active_nodes) if len(adjacency[node]) == 1]
-        if not leaves:
-            break
-
-        changed = False
-        for leaf in leaves:
-            if leaf not in active_nodes or len(adjacency[leaf]) != 1:
+            
+        adjacency = _sparse_to_adjacency_dict(current_J)
+        
+        matched = np.zeros(current_n, dtype=bool)
+        remap = np.full(current_n, -1, dtype=np.int64)
+        new_n = 0
+        
+        visit_order = np.random.permutation(current_n)
+        
+        new_groups = []
+        new_weights = []
+        
+        for u in visit_order:
+            if matched[u]:
                 continue
-            neighbor = next(iter(adjacency[leaf]))
-            changed |= merge_leaf(leaf, neighbor)
-        if not changed:
+            matched[u] = True
+            
+            best_v = -1
+            best_w = -1.0
+            for v, edge_w in adjacency[u].items():
+                if not matched[v] and current_weights[u] + current_weights[v] <= max_node_weight:
+                    if edge_w > best_w:
+                        best_w = edge_w
+                        best_v = v
+                        
+            if best_v != -1:
+                matched[best_v] = True
+                remap[u] = new_n
+                remap[best_v] = new_n
+                new_groups.append(groups[u] + groups[best_v])
+                new_weights.append(current_weights[u] + current_weights[best_v])
+            else:
+                remap[u] = new_n
+                new_groups.append(groups[u])
+                new_weights.append(current_weights[u])
+                
+            new_n += 1
+            
+        if new_n == current_n:
             break
-
-    survivors = sorted(active_nodes)
-    remap = {old: new for new, old in enumerate(survivors)}
-
-    rows = []
-    cols = []
-    values = []
-    coarse_groups = []
-    coarse_weights = []
+            
+        indices = current_J.indices()
+        values = current_J.values()
+        
+        coarse_rows = remap[indices[0].numpy()]
+        coarse_cols = remap[indices[1].numpy()]
+        
+        valid = coarse_rows != coarse_cols
+        
+        if np.any(valid):
+            coarse_indices = torch.tensor(np.stack([coarse_rows[valid], coarse_cols[valid]]), dtype=torch.long)
+            coarse_values = values[torch.from_numpy(valid)]
+            current_J = torch.sparse_coo_tensor(coarse_indices, coarse_values, (new_n, new_n)).coalesce()
+        else:
+            current_J = torch.sparse_coo_tensor(torch.empty((2, 0), dtype=torch.long), torch.empty((0,), dtype=torch.float32), (new_n, new_n)).coalesce()
+            
+        current_n = new_n
+        current_weights = np.array(new_weights, dtype=np.float32)
+        groups = new_groups
+        
+    coarse_node_weights = torch.tensor(current_weights, dtype=torch.float32)
+    
     original_to_coarse = np.empty(n, dtype=np.int64)
-
-    for old_node in survivors:
-        new_node = remap[old_node]
-        coarse_groups.append(groups[old_node])
-        coarse_weights.append(weights[old_node])
-        for original_node in groups[old_node]:
-            original_to_coarse[original_node] = new_node
-
-        for neighbor, edge_weight in adjacency[old_node].items():
-            if neighbor in remap:
-                rows.append(new_node)
-                cols.append(remap[neighbor])
-                values.append(edge_weight)
-
-    if rows:
-        indices = torch.tensor([rows, cols], dtype=torch.long)
-        weights_tensor = torch.tensor(values, dtype=torch.float32)
-        coarse_J = torch.sparse_coo_tensor(indices, weights_tensor, (len(survivors), len(survivors))).coalesce()
-    else:
-        coarse_J = torch.sparse_coo_tensor(torch.empty((2, 0), dtype=torch.long), torch.empty((0,), dtype=torch.float32), (len(survivors), len(survivors))).coalesce()
-
-    coarse_node_weights = torch.tensor(coarse_weights, dtype=torch.float32)
-    return coarse_J, coarse_node_weights, coarse_groups, original_to_coarse
+    for c_node, members in enumerate(groups):
+        for member in members:
+            original_to_coarse[member] = c_node
+            
+    return current_J, coarse_node_weights, groups, original_to_coarse
 
 
 def expand_coarse_labels(coarse_groups: list, coarse_labels: np.ndarray, num_nodes: int):

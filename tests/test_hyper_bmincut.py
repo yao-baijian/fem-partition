@@ -105,11 +105,10 @@ elif partition_method == 'pubo_direct':
 elif partition_method in ['coarsen_fem_refine', 'coarsen_kahypar_refine', 'pubo_coarsen', 'pubo_q4_explicit']:
     print(f"====== Running {partition_method} ======")
     # Step 1: Multi-level coarsening
-    coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_leaf_folding(
+    coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_matching(
         clique_graph,
         node_weights=torch.ones(num_nodes, dtype=torch.float32),
-        max_degree=500,
-        min_nodes=5000,
+        coarsen_to=500,
     )
     
     num_coarse_nodes = coarse_graph.shape[0]
@@ -203,7 +202,7 @@ elif partition_method in ['coarsen_fem_refine', 'coarsen_kahypar_refine', 'pubo_
         print(f"Explicit q=4 PUBO partitioning took: {time.time() - start_time:.4f} seconds")
         
     # -----------------------------
-    # Option B: FEM (备选实现/Fallback implementation)
+    # Option B: FEM (备选实�?Fallback implementation)
     if partition_method == 'coarsen_fem_refine':
         print("Using FEM as the primary solver on the coarsened graph (Sparse)...")
         graph_for_fem = coarse_graph # Use original sparse representation!
@@ -244,10 +243,10 @@ else:
     final_assignment = initial_assignment
 
 # 4. Final Output & Evaluation
-fem_cut_value, avg_imbalance = evaluate_kahypar_cut_value(final_assignment, hyperedges, [1.0] * len(hyperedges))
+fem_cut_value, max_imbalance = evaluate_kahypar_cut_value(final_assignment, hyperedges, [1.0] * len(hyperedges))
 
 print(f'\n--- Final Results ---')
 print(f'Instance: {instance}')
 print(f'Method Executed: {partition_method}')
 print(f'Cut Value (k-1 metric): {fem_cut_value}')
-print(f'Max Imbalance: {avg_imbalance:.6f}')
+print(f'Max Imbalance: {max_imbalance:.6f}')
