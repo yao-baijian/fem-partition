@@ -1,7 +1,7 @@
 import torch
 from .problem import *
 from math import log
-from utils import *
+from .utils import *
 
 def entropy_q(p):
     """

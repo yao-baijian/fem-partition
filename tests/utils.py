@@ -382,3 +382,107 @@ def greedy_refine_hypergraph(
             break
             
     return assignment
+
+
+def simple_kaffpa(vwgt, xadj, adjcwgt, adjncy, q, epsilon=0.05, someflag=False, arg7=0, arg8=0, part=None, max_passes=10):
+    """
+    Simple replacement for kaffpa: perform local greedy refinement (KL/FM-like)
+    starting from `part` (list of length n). Returns (edgecut, part_list).
+    - `vwgt`, `xadj`, `adjcwgt`, `adjncy` follow KaHIP conventions.
+    - `q` number of partitions.
+    - `epsilon` allowed imbalance fraction.
+    - `max_passes` number of refinement passes.
+    """
+    import numpy as _np
+
+    n = len(vwgt)
+    if part is None:
+        # balanced random start
+        base = _np.arange(n) % q
+        _np.random.shuffle(base)
+        part = base.tolist()
+    else:
+        part = list(part)
+
+    # build neighbor lists with weights
+    neighbors = [[] for _ in range(n)]
+    for i in range(n):
+        start = xadj[i]
+        end = xadj[i+1]
+        for idx in range(start, end):
+            j = adjncy[idx]
+            w = adjcwgt[idx]
+            neighbors[i].append((j, w))
+
+    counts = _np.bincount(_np.array(part, dtype=int), minlength=q)
+    ideal = n / float(q)
+    max_size = ideal * (1.0 + epsilon)
+
+    def compute_edgecut(parts):
+        cut = 0.0
+        for i in range(n):
+            for j, w in neighbors[i]:
+                if i < j and parts[i] != parts[j]:
+                    cut += w
+        return int(cut)
+
+    for _pass in range(max_passes):
+        moved = False
+        order = _np.random.permutation(n)
+        for v in order:
+            old = part[v]
+            # compute weight to each group
+            weight_to = _np.zeros(q, dtype=float)
+            for u, w in neighbors[v]:
+                weight_to[part[u]] += w
+
+            best_delta = 0.0
+            best_group = old
+            for g in range(q):
+                if g == old:
+                    continue
+                if counts[g] + 1 > max_size:
+                    continue
+                # delta = change_in_cut = sum_w_to_old - sum_w_to_new
+                delta = weight_to[old] - weight_to[g]
+                if delta < best_delta:
+                    best_delta = delta
+                    best_group = g
+
+            if best_group != old:
+                # apply move
+                part[v] = int(best_group)
+                counts[old] -= 1
+                counts[best_group] += 1
+                moved = True
+
+        if not moved:
+            break
+
+    edgecut = compute_edgecut(part)
+    return int(edgecut), part
+
+
+def call_pymetis_with_part(q, adjacency_list, part=None):
+    """Call pymetis.part_graph and pass `part` when supported by the wrapper.
+    If the wrapper doesn't accept `part`, prints a clear warning and calls
+    without it (no silent fallback). Returns (edgecuts, parts).
+    """
+    import importlib, inspect, sys
+    try:
+        pymetis = importlib.import_module('pymetis')
+    except Exception as e:
+        raise ImportError(f"pymetis is not available: {e}")
+
+    try:
+        sig = inspect.signature(pymetis.part_graph)
+        params = list(sig.parameters.keys())
+    except Exception:
+        params = []
+
+    if 'part' in params:
+        return pymetis.part_graph(q, adjacency=adjacency_list, part=part)
+    else:
+        # Explicit informative warning (not silent fallback)
+        print("Warning: installed pymetis.part_graph does not accept 'part' argument; calling without initial partition", file=sys.stderr)
+        return pymetis.part_graph(q, adjacency=adjacency_list)

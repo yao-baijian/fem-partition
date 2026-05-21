@@ -41,6 +41,9 @@ instance = '../partition/full_benchmark_set/as-caida.mtx.hgr'
 # ==========================================
 partition_method = 'pubo_q4_explicit'
 
+# remember requested mode to decide whether to run KaHyPar-based refinement later
+requested_method = partition_method
+
 q_ways = 4 if partition_method == 'pubo_q4_explicit' else 2
 
 print(f"Loading {instance}...")
@@ -116,11 +119,10 @@ elif partition_method in ['coarsen_fem_refine', 'coarsen_kahypar_refine', 'pubo_
     # Step 2: Initial Partition on Coarsened Graph
     # -----------------------------
     # Option A: KaHyPar (Environment Check)
+    use_kahypar_refine = False
     if partition_method == 'coarsen_kahypar_refine' and HAS_KAHYPAR:
-        print("Using KaHyPar for initial coarse partition...")
-        print("Fallback warning: Complex coarse hyperedge construction omitted due to missing full kahypar context. Reverting to FEM-based initial guess.")
-        partition_method = 'coarsen_fem_refine'
-        
+        print("Using KaHyPar for refinement when available (will use FEM for coarse initial assignment).")
+        use_kahypar_refine = True
     elif partition_method == 'coarsen_kahypar_refine' and not HAS_KAHYPAR:
         print("KaHyPar is requested but not installed. Falling back to FEM on the coarsened graph (coarsen_fem_refine).")
         partition_method = 'coarsen_fem_refine'
@@ -230,15 +232,40 @@ if partition_method in ['coarsen_fem_refine', 'coarsen_kahypar_refine', 'pubo_co
     print("Step 3: Uncoarsening (Projection) back to original hypergraph...")
     group_assignment = expand_coarse_labels(coarse_groups, initial_assignment, num_nodes)
     
-    print("Step 3: Running Greedy Refinement (Local Swap)...")
-    final_assignment = greedy_refine_hypergraph(
-        group_assignment, 
-        hyperedges, 
-        [1.0] * len(hyperedges), 
-        q=2, 
-        max_passes=5,
-        max_imbalance=0.05  # target imbalance <= 0.05 as requested
-    )
+    # If KaHyPar was requested and is available, use it to refine the partition
+    if requested_method == 'coarsen_kahypar_refine' and use_kahypar_refine:
+        print("Step 3: Running KaHyPar refinement on the original hypergraph...")
+        # Build hypergraph for kahypar
+        hyperedges_indices = []
+        hyperedges_ptrs = [0]
+        for he in hyperedges:
+            hyperedges_indices.extend(he)
+            hyperedges_ptrs.append(len(hyperedges_indices))
+
+        hg = kahypar.Hypergraph(num_nodes, len(hyperedges), hyperedges_indices, hyperedges_ptrs, 2, [1]*len(hyperedges), [1]*num_nodes)
+        for i in range(num_nodes):
+            hg.setNodePart(i, int(group_assignment[i]))
+
+        ctx = kahypar.Context()
+        try:
+            ctx.loadINIconfiguration('kahypar_config.ini')
+        except Exception:
+            pass
+        ctx.setK(2)
+        ctx.setEpsilon(0.05)
+
+        kahypar.improvePartition(hg, ctx)
+        final_assignment = [hg.blockID(i) for i in range(num_nodes)]
+    else:
+        print("Step 3: Running Greedy Refinement (Local Swap)...")
+        final_assignment = greedy_refine_hypergraph(
+            group_assignment, 
+            hyperedges, 
+            [1.0] * len(hyperedges), 
+            q=2, 
+            max_passes=5,
+            max_imbalance=0.05  # target imbalance <= 0.05 as requested
+        )
 else:
     final_assignment = initial_assignment
 
