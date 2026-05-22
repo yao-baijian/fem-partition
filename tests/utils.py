@@ -301,10 +301,27 @@ class PUBOObjective:
         import torch
         # Dummy result since we recalculate cut with `evaluate_kahypar_cut_value` anyway. 
         # But FEM solver needs `config` and `results`.
+        q = int(self.q)
+        n = int(self.node_weights.numel())
+
+        if p.dim() == 2:
+            # FEM may flatten the batch dimension into the first axis, keep q on the last axis.
+            if p.shape[1] == q:
+                if p.shape[0] % n != 0:
+                    raise ValueError(f"Cannot reshape 2D p with shape {tuple(p.shape)} into (-1, {n}, {q})")
+                p = p.reshape(-1, n, q)
+            elif p.shape[0] == n and q == 2:
+                p = p.reshape(1, n, q)
+            else:
+                raise ValueError(f"Unexpected 2D p shape: {tuple(p.shape)} for n={n}, q={q}")
+
+        if p.dim() != 3:
+            raise ValueError(f"Unexpected p dim: {p.dim()} with shape {tuple(p.shape)}")
+
         config = torch.zeros_like(p)
         config.scatter_(2, p.argmax(dim=2, keepdim=True), 1)
         # return dummy low objective values to allow FEM to just pick the best config based on argmax.
-        dummy_results = torch.zeros(p.shape[0], device=p.device)
+        dummy_results = torch.zeros(config.shape[0], device=p.device)
         return config, dummy_results
 
 def greedy_refine_hypergraph(
@@ -381,6 +398,95 @@ def greedy_refine_hypergraph(
         if not moved_any:
             break
             
+    return assignment
+
+
+def greedy_initial_hypergraph_partition(
+    hyperedges: list,
+    num_nodes: int,
+    q: int,
+    hyperedge_weights: list = None,
+    max_imbalance: float = 0.05,
+    seed: int = None,
+):
+    """
+    Build a balanced initial q-way partition for a hypergraph using a simple
+    greedy vertex placement heuristic.
+
+    The goal is not to mimic KaHyPar's full machinery, but to provide a
+    deterministic, self-contained coarse assignment that can be refined later.
+    """
+    rng = np.random.default_rng(seed)
+    if hyperedge_weights is None:
+        hyperedge_weights = [1.0] * len(hyperedges)
+
+    node_to_he = [[] for _ in range(num_nodes)]
+    node_weight = np.zeros(num_nodes, dtype=float)
+    for e_idx, he in enumerate(hyperedges):
+        w = float(hyperedge_weights[e_idx])
+        for v in he:
+            if 0 <= v < num_nodes:
+                node_to_he[v].append(e_idx)
+                node_weight[v] += w
+
+    order = np.arange(num_nodes)
+    # High-degree / high-weight vertices first; break ties randomly.
+    tie_breaker = rng.random(num_nodes)
+    order = np.lexsort((tie_breaker, -node_weight))
+
+    assignment = np.full(num_nodes, -1, dtype=np.int64)
+    group_sizes = np.zeros(q, dtype=np.int64)
+    ideal = num_nodes / float(q)
+    max_size = int(np.ceil(ideal * (1.0 + max_imbalance)))
+
+    if num_nodes >= q:
+        seed_nodes = order[:q]
+        for g, v in enumerate(seed_nodes):
+            assignment[v] = g
+            group_sizes[g] += 1
+        remaining_order = order[q:]
+    else:
+        remaining_order = order
+
+    def boundary_cost(v, g):
+        cost = 0.0
+        for e_idx in node_to_he[v]:
+            he = hyperedges[e_idx]
+            w = float(hyperedge_weights[e_idx])
+            pins = 0
+            same = 0
+            for u in he:
+                au = assignment[u]
+                if au != -1:
+                    pins += 1
+                    if au == g:
+                        same += 1
+            # Prefer groups where the new vertex joins existing pins.
+            if same == 0:
+                cost += w
+            elif same == pins:
+                cost -= w
+        return cost
+
+    for v in remaining_order:
+        best_group = None
+        best_cost = None
+        candidates = np.arange(q)
+        rng.shuffle(candidates)
+        for g in candidates:
+            if group_sizes[g] + 1 > max_size:
+                continue
+            cost = boundary_cost(v, g)
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_group = g
+
+        if best_group is None:
+            best_group = int(np.argmin(group_sizes))
+
+        assignment[v] = best_group
+        group_sizes[best_group] += 1
+
     return assignment
 
 

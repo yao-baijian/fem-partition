@@ -286,81 +286,78 @@ def expected_hyperbmincut_max_expected_nodes(J, p, hyperedges):
     print(f"Weighted Cut value: {total_cut_value}")
     return total_cut_value
 
-def expected_hyperbmincut_all_comb(J, p, hyperedges):
-    total_cut_value = 0.0
-    m = 4  # 簇数
-    
-    # 预定义所有组合
-    pair_masks = torch.tensor([
-        [1, 1, 0, 0],  # (0,1)
-        [1, 0, 1, 0],  # (0,2) 
-        [1, 0, 0, 1],  # (0,3)
-        [0, 1, 1, 0],  # (1,2)
-        [0, 1, 0, 1],  # (1,3)
-        [0, 0, 1, 1],  # (2,3)
-    ], dtype=torch.float32, device=p.device)
-    
-    triple_masks = torch.tensor([
-        [1, 1, 1, 0],  # (0,1,2)
-        [1, 1, 0, 1],  # (0,1,3)
-        [1, 0, 1, 1],  # (0,2,3)
-        [0, 1, 1, 1],  # (1,2,3)
-    ], dtype=torch.float32, device=p.device)
-    
-    for he_idx, he in enumerate(hyperedges):
-        weight = 1.0
-        k = len(he)
-        
-        he_probs = p[:, he, :]  # [batch, k, m]
-        batch_size = he_probs.shape[0]
-        
-        # 1. 计算 P(跨区数=1) - 向量化
-        prob_single_cluster = torch.sum(torch.prod(he_probs, dim=1), dim=1)  # [batch]
-        
-        # 2. 计算 P(跨区数=2) - 向量化
-        # 扩展维度用于广播 [6, 4] -> [batch, 6, k, 4]
-        pair_masks_expanded = pair_masks.view(1, 6, 1, 4).expand(batch_size, 6, k, 4)
-        he_probs_expanded = he_probs.unsqueeze(1).expand(batch_size, 6, k, 4)
-        
-        # 计算每个组合的概率 [batch, 6]
-        pair_probs = torch.prod(
-            torch.sum(he_probs_expanded * pair_masks_expanded, dim=3), 
-            dim=2
-        )
-        sum_2comb = torch.sum(pair_probs, dim=1)  # [batch]
-        prob_2_clusters = sum_2comb - 2 * prob_single_cluster
-        
-        # 3. 计算 P(跨区数=3) - 向量化
-        triple_masks_expanded = triple_masks.view(1, 4, 1, 4).expand(batch_size, 4, k, 4)
-        he_probs_expanded_triple = he_probs.unsqueeze(1).expand(batch_size, 4, k, 4)
-        
-        triple_probs = torch.prod(
-            torch.sum(he_probs_expanded_triple * triple_masks_expanded, dim=3), 
-            dim=2
-        )
-        sum_3comb = torch.sum(triple_probs, dim=1)  # [batch]
-        prob_3_clusters = sum_3comb - 2 * sum_2comb + 3 * prob_single_cluster
-        
-        # 4. 计算 P(跨区数=4)
-        prob_4_clusters = 1 - prob_single_cluster - prob_2_clusters - prob_3_clusters
-        
-        epsilon = 1e-3
-        # prob_2 = torch.log(prob_2_clusters + epsilon)
-        # prob_3 = torch.log(prob_3_clusters + epsilon) 
-        # prob_4 = torch.log(prob_4_clusters + epsilon)
-        
-        prob_2 = prob_2_clusters
-        prob_3 = prob_3_clusters
-        prob_4 = prob_4_clusters
+def expected_hyperbmincut_explicit(J, p, hyperedges):
+    # Vectorized implementation across hyperedges grouped by edge-size
+    device = p.device
+    m = 4  # fixed cluster count for this explicit routine
 
-        # prob_2 = torch.log(torch.sqrt(prob_2_clusters))
-        # prob_3 = torch.log(torch.sqrt(prob_3_clusters))
-        # prob_4 = torch.sqrt(prob_4_clusters) - epsilon
-        
-        total_cut_value += prob_2 + 2 * prob_3 + 3 * prob_4
-    
-    print(f"Weighted Cut value: {total_cut_value}")
-    return total_cut_value
+    # Precompute masks on device
+    pair_masks = torch.tensor([
+        [1, 1, 0, 0],
+        [1, 0, 1, 0],
+        [1, 0, 0, 1],
+        [0, 1, 1, 0],
+        [0, 1, 0, 1],
+        [0, 0, 1, 1],
+    ], dtype=torch.float32, device=device)
+
+    triple_masks = torch.tensor([
+        [1, 1, 1, 0],
+        [1, 1, 0, 1],
+        [1, 0, 1, 1],
+        [0, 1, 1, 1],
+    ], dtype=torch.float32, device=device)
+
+    # Group hyperedges by size to batch-gather p efficiently
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for idx, he in enumerate(hyperedges):
+        groups[len(he)].append((idx, he))
+
+    total_cut = None
+    for k, he_list in groups.items():
+        # build index tensor: (num_edges_in_group, k)
+        idxs = torch.tensor([he for (_, he) in he_list], dtype=torch.long, device=device)
+        # gather probabilities: p has shape [batch, n, m]
+        # result: [batch, num_edges, k, m]
+        he_probs = p[:, idxs, :]
+
+        # prod over nodes -> [batch, num_edges, m]
+        prod_k = torch.prod(he_probs, dim=2)
+        prob_single = prod_k.sum(dim=2)  # [batch, num_edges]
+
+        batch_size = he_probs.shape[0]
+
+        # pairs
+        # pair computation: for each pair-mask, sum probabilities over selected clusters per node, then prod over nodes
+        he_probs_exp = he_probs.unsqueeze(2)  # [batch, num_edges, 1, k, m]
+        pair_masks_expanded = pair_masks.view(1, 1, 6, 1, 4).to(device)  # [1,1,6,1,4]
+        sum_clusters = (he_probs_exp * pair_masks_expanded).sum(dim=4)  # [batch, num_edges, 6, k]
+        pair_probs = torch.prod(sum_clusters, dim=3)  # [batch, num_edges, 6]
+        sum_2comb = pair_probs.sum(dim=2)  # [batch, num_edges]
+        prob_2 = sum_2comb - 2 * prob_single
+
+        # triples
+        he_probs_exp_t = he_probs.unsqueeze(2)  # [batch, num_edges, 1, k, m]
+        triple_masks_expanded = triple_masks.view(1, 1, 4, 1, 4).to(device)
+        sum_clusters_t = (he_probs_exp_t * triple_masks_expanded).sum(dim=4)  # [batch, num_edges, 4, k]
+        triple_probs = torch.prod(sum_clusters_t, dim=3)  # [batch, num_edges, 4]
+        sum_3comb = triple_probs.sum(dim=2)  # [batch, num_edges]
+        prob_3 = sum_3comb - 2 * sum_2comb + 3 * prob_single
+
+        prob_4 = 1.0 - prob_single - prob_2 - prob_3
+
+        contrib = prob_2 + 2.0 * prob_3 + 3.0 * prob_4  # [batch, num_edges]
+        # accumulate
+        if total_cut is None:
+            total_cut = contrib.sum(dim=1)
+        else:
+            total_cut = total_cut + contrib.sum(dim=1)
+
+    if total_cut is None:
+        # no hyperedges -> zero
+        return torch.zeros(p.shape[0], device=device)
+    return total_cut
 
         # total_cut_value = total_cut_value + prob_2_clusters + prob_3_clusters * 2 + prob_4_clusters * 3
         

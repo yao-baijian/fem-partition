@@ -26,7 +26,7 @@ except ImportError:
 # num_steps = 1000
 
 num_trials = 1
-num_steps = 100
+num_steps = 50
 dev = 'cpu'
 instance = '../partition/full_benchmark_set/as-caida.mtx.hgr'
 
@@ -35,16 +35,97 @@ instance = '../partition/full_benchmark_set/as-caida.mtx.hgr'
 # 'direct_fem'             : Original FEM applied directly to the clique-expanded hypergraph
 # 'coarsen_fem_refine_kahypar' : QUBO-based matching coarsening (FEM) + KaHyPar on coarse hypergraph
 # 'coarsen_kahypar_refine' : Multi-level coarsening + KaHyPar initial guess + Greedy refinement
+# 'kahyper_like'           : Self-implemented KaHyPar-like coarsening + greedy coarse solve + greedy refinement
 # 'pubo_direct'            : Full PUBO-based objective directly on hypergraph (Auto Grad + Opt)
 # 'pubo_coarsen'           : Coarsening framework + PUBO on the compressed hyperedges
-# 'pubo_q4_explicit'       : Coarsening + explicit formulation via expected_hyperbmincut_all_comb
+# 'pubo_q4_explicit'       : Coarsening + explicit formulation via expected_hyperbmincut_explicit
+# 'pubo_implicit'         : Coarsening + approximate formulation via expected_hyperbmincut
 # ==========================================
-partition_method = 'coarsen_fem_refine_kahypar'
+partition_method = 'kahyper_like'
 
 # remember requested mode to decide whether to run KaHyPar-based refinement later
 requested_method = partition_method
 
-q_ways = 4 if partition_method == 'pubo_q4_explicit' else 2
+# Default number of partitions. Allow PUBO flows to use q=4 when requested.
+if partition_method in ('pubo_q4_explicit', 'pubo_implicit', 'pubo_direct', 'pubo_coarsen'):
+    q_ways = 4
+else:
+    q_ways = 2
+
+
+def build_coarse_hyperedges(hyperedges_list, original_to_coarse_map, node_count):
+    coarse_hyperedges_list = []
+    for he in hyperedges_list:
+        coarse_he = list(set(int(original_to_coarse_map[v]) for v in he if v < node_count))
+        if len(coarse_he) > 1:
+            coarse_hyperedges_list.append(coarse_he)
+    return coarse_hyperedges_list
+
+
+def make_q4_pubo_object(hyperedges_list, node_weights_list, cut_func, num_nodes_local, q_local, imbalance_weight=5.0):
+    from FEM.problem import weighted_imbalance_penalty
+
+    class _Q4PUBO:
+        def __init__(self):
+            self.hyperedges = hyperedges_list
+            self.node_weights = torch.tensor(node_weights_list, dtype=torch.float32)
+            self.imbalance_weight = imbalance_weight
+
+        def expectation(self, _, p):
+            self.node_weights = self.node_weights.to(p.device)
+            cut_loss = cut_func(None, p, self.hyperedges)
+            imb_penalty = weighted_imbalance_penalty(p, self.node_weights.cpu().numpy())
+            return cut_loss + self.imbalance_weight * imb_penalty
+
+        def inference(self, _, p):
+            q = q_local
+            n = num_nodes_local
+
+            if p.dim() == 2:
+                if p.shape[1] == q:
+                    if p.shape[0] % n != 0:
+                        raise ValueError(f"Cannot reshape 2D p with shape {tuple(p.shape)} into (-1, {n}, {q})")
+                    p = p.reshape(-1, n, q)
+                elif p.shape[0] == n and q == 2:
+                    p = p.reshape(1, n, q)
+                else:
+                    raise ValueError(f"Unexpected 2D p shape: {tuple(p.shape)} for n={n}, q={q}")
+
+            if p.dim() != 3:
+                raise ValueError(f"Unexpected p dim: {p.dim()} with shape {tuple(p.shape)}")
+
+            config = torch.zeros_like(p)
+            config.scatter_(2, p.argmax(dim=2, keepdim=True), 1)
+            return config, torch.zeros(config.shape[0], device=p.device)
+
+    return _Q4PUBO()
+
+
+def run_kahypar_like_multilevel(clique_graph_local, hyperedges_local, num_nodes_local, q_local, coarsen_to=500):
+    coarse_graph_local, coarse_node_weights_local, coarse_groups_local, original_to_coarse_local = coarsen_graph_by_matching(
+        clique_graph_local,
+        node_weights=torch.ones(num_nodes_local, dtype=torch.float32),
+        coarsen_to=coarsen_to,
+    )
+
+    coarse_hyperedges_local = build_coarse_hyperedges(hyperedges_local, original_to_coarse_local, num_nodes_local)
+    initial_assignment_local = greedy_initial_hypergraph_partition(
+        coarse_hyperedges_local,
+        coarse_graph_local.shape[0],
+        q_local,
+        hyperedge_weights=[1.0] * len(coarse_hyperedges_local),
+        max_imbalance=0.05,
+    )
+    initial_assignment_local = greedy_refine_hypergraph(
+        initial_assignment_local,
+        coarse_hyperedges_local,
+        [1.0] * len(coarse_hyperedges_local),
+        q=q_local,
+        max_passes=5,
+        max_imbalance=0.05,
+    )
+
+    return coarse_graph_local, coarse_node_weights_local, coarse_groups_local, original_to_coarse_local, initial_assignment_local
 
 print(f"Loading {instance}...")
 hyperedges = parse_hypergraph_edges(instance)
@@ -105,16 +186,26 @@ elif partition_method == 'pubo_direct':
     print(f"Direct PUBO solve took: {time.time() - start_time:.4f} seconds")
     coarse_groups = None
 
-elif partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine', 'pubo_coarsen', 'pubo_q4_explicit']:
+elif partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine', 'kahyper_like', 'pubo_coarsen', 'pubo_q4_explicit', 'pubo_implicit']:
     print(f"====== Running {partition_method} ======")
-    # Step 1: Multi-level coarsening
-    coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_matching(
-        clique_graph,
-        node_weights=torch.ones(num_nodes, dtype=torch.float32),
-        coarsen_to=500,
-    )
-    
-    num_coarse_nodes = coarse_graph.shape[0]
+    if partition_method in ['coarsen_kahypar_refine', 'kahyper_like']:
+        coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse, initial_assignment = run_kahypar_like_multilevel(
+            clique_graph,
+            hyperedges,
+            num_nodes,
+            q_ways,
+        )
+        num_coarse_nodes = coarse_graph.shape[0]
+        print(f"KaHyPar-like coarse partitioning took: {time.time() - start_time:.4f} seconds")
+    else:
+        # Step 1: Multi-level coarsening
+        coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_matching(
+            clique_graph,
+            node_weights=torch.ones(num_nodes, dtype=torch.float32),
+            coarsen_to=500,
+        )
+        
+        num_coarse_nodes = coarse_graph.shape[0]
     
     # Step 2: Initial Partition on Coarsened Graph
     # -----------------------------
@@ -157,38 +248,26 @@ elif partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine'
         initial_assignment = best_config.argmax(dim=1).cpu().numpy()
         print(f"Coarse PUBO partitioning took: {time.time() - start_time:.4f} seconds")
 
+    if partition_method in ['coarsen_kahypar_refine', 'kahyper_like']:
+        print("Using self-implemented KaHyPar-like coarse solve (FEM) on the coarsened graph...")
+        # `initial_assignment` is already produced by run_kahypar_like_multilevel().
+        pass
+
     # -----------------------------
     # Option D: Explicit q=4 Formulations PUBO on Coarse Graph
     if partition_method == 'pubo_q4_explicit':
-        print("Using Explicit q=4 PUBO (expected_hyperbmincut_all_comb) on the coarsened graph...")
-        # Map original hyperedges to coarse hyperedges
-        coarse_hyperedges = []
-        for he in hyperedges:
-            che = list(set([original_to_coarse[v] for v in he if v < num_nodes]))
-            if len(che) > 1:
-                coarse_hyperedges.append(che)
-                
-        from FEM.customized_problem.hyper_bmincut import expected_hyperbmincut_all_comb
-        from FEM.problem import weighted_imbalance_penalty
+        print("Using Explicit q=4 PUBO on the coarsened graph...")
+        coarse_hyperedges = build_coarse_hyperedges(hyperedges, original_to_coarse, num_nodes)
 
-        class ExplicitQ4PUBO:
-            def __init__(self, hyperedges_list, node_weights_list, imbalance_weight=5.0):
-                self.hyperedges = hyperedges_list
-                self.node_weights = torch.tensor(node_weights_list, dtype=torch.float32)
-                self.imbalance_weight = imbalance_weight
+        from FEM.customized_problem.hyper_bmincut import expected_hyperbmincut_explicit
 
-            def expectation(self, _, p):
-                self.node_weights = self.node_weights.to(p.device)
-                cut_loss = expected_hyperbmincut_all_comb(None, p, self.hyperedges)
-                imb_penalty = weighted_imbalance_penalty(p, self.node_weights.cpu().numpy())
-                return cut_loss + self.imbalance_weight * imb_penalty
-                
-            def inference(self, _, p):
-                config = torch.zeros_like(p)
-                config.scatter_(2, p.argmax(dim=2, keepdim=True), 1)
-                return config, torch.zeros(p.shape[0], device=p.device)
-
-        pubo_obj = ExplicitQ4PUBO(coarse_hyperedges, coarse_node_weights)
+        pubo_obj = make_q4_pubo_object(
+            coarse_hyperedges,
+            coarse_node_weights,
+            expected_hyperbmincut_explicit,
+            num_coarse_nodes,
+            q_ways,
+        )
         
         dummy_matrix = torch.zeros((num_coarse_nodes, num_coarse_nodes))
         case_bmincut = FEM()
@@ -202,6 +281,34 @@ elif partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine'
         best_config = config[0]
         initial_assignment = best_config.argmax(dim=1).cpu().numpy()
         print(f"Explicit q=4 PUBO partitioning took: {time.time() - start_time:.4f} seconds")
+
+    # -----------------------------
+    # Option E: Implicit q=4 Formulation PUBO on Coarse Graph
+    if partition_method == 'pubo_implicit':
+        print("Using implicit q=4 PUBO on the coarsened graph...")
+        from FEM.customized_problem.hyper_bmincut import expected_hyperbmincut
+        coarse_hyperedges = build_coarse_hyperedges(hyperedges, original_to_coarse, num_nodes)
+
+        pubo_obj = make_q4_pubo_object(
+            coarse_hyperedges,
+            coarse_node_weights,
+            expected_hyperbmincut,
+            num_coarse_nodes,
+            q_ways,
+        )
+
+        dummy_matrix = torch.zeros((num_coarse_nodes, num_coarse_nodes))
+        case_bmincut = FEM()
+        case_bmincut.set_up_problem(
+            num_coarse_nodes, 0, 'customize', dummy_matrix, q=q_ways,
+            customize_expected_func=pubo_obj.expectation,
+            customize_infer_func=pubo_obj.inference
+        )
+        case_bmincut.set_up_solver(num_trials, num_steps, anneal='lin', dev=dev, q=q_ways, manual_grad=False)
+        config, result = case_bmincut.solve()
+        best_config = config[0]
+        initial_assignment = best_config.argmax(dim=1).cpu().numpy()
+        print(f"Implicit q=4 PUBO partitioning took: {time.time() - start_time:.4f} seconds")
         
     # -----------------------------
     # Option B: QUBO-based matching coarsening using FEM, then KaHyPar on coarse hypergraph
@@ -314,7 +421,7 @@ else:
     raise ValueError(f"Unknown partition method: {partition_method}")
 
 # 3. Projection & Refinement
-if partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine', 'pubo_coarsen']:
+if partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine', 'kahyper_like', 'pubo_coarsen', 'pubo_q4_explicit', 'pubo_implicit']:
     print("Step 3: Uncoarsening (Projection) back to original hypergraph...")
     group_assignment = expand_coarse_labels(coarse_groups, initial_assignment, num_nodes)
     
@@ -328,7 +435,7 @@ if partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine', 
             hyperedges_indices.extend(he)
             hyperedges_ptrs.append(len(hyperedges_indices))
 
-        hg = kahypar.Hypergraph(num_nodes, len(hyperedges), hyperedges_indices, hyperedges_ptrs, 2, [1]*len(hyperedges), [1]*num_nodes)
+        hg = kahypar.Hypergraph(num_nodes, len(hyperedges), hyperedges_indices, hyperedges_ptrs, q_ways, [1]*len(hyperedges), [1]*num_nodes)
         for i in range(num_nodes):
             hg.setNodePart(i, int(group_assignment[i]))
 
@@ -337,7 +444,7 @@ if partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine', 
             ctx.loadINIconfiguration('kahypar_config.ini')
         except Exception:
             pass
-        ctx.setK(2)
+        ctx.setK(q_ways)
         ctx.setEpsilon(0.05)
 
         kahypar.improvePartition(hg, ctx)
@@ -348,7 +455,7 @@ if partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine', 
             group_assignment, 
             hyperedges, 
             [1.0] * len(hyperedges), 
-            q=2, 
+            q=q_ways, 
             max_passes=5,
             max_imbalance=0.05  # target imbalance <= 0.05 as requested
         )
