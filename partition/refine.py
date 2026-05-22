@@ -22,6 +22,63 @@ def _balance_limits(assignment, max_imbalance, q=None):
     return q, counts, min_size, max_size
 
 
+def _repair_balance_fast(assignment, hyperedges, max_imbalance=0.05, seed=None, q=None):
+    """Fast balance repair without cut evaluation."""
+    rng = np.random.default_rng(seed)
+    assignment = np.asarray(assignment, dtype=np.int64).copy()
+    if assignment.size == 0:
+        return assignment
+
+    q, counts, min_size, max_size = _balance_limits(assignment, max_imbalance, q=q)
+    node_degree = np.zeros(assignment.size, dtype=float)
+    for he in hyperedges:
+        for v in he:
+            if 0 <= v < assignment.size:
+                node_degree[v] += 1.0
+
+    for _ in range(max(1, assignment.size * 2)):
+        over = np.where(counts > max_size)[0]
+        if len(over) == 0:
+            break
+
+        under = np.where(counts < min_size)[0]
+        if len(under) == 0:
+            under = np.array([int(np.argmin(counts))], dtype=int)
+
+        donor = int(over[np.argmax(counts[over] - max_size)])
+        donor_vertices = np.where(assignment == donor)[0]
+        if donor_vertices.size == 0:
+            break
+
+        rng.shuffle(donor_vertices)
+        donor_vertices = donor_vertices[np.argsort(node_degree[donor_vertices], kind='mergesort')]
+
+        moved = False
+        for v in donor_vertices:
+            for g in under:
+                g = int(g)
+                if g == donor:
+                    continue
+                if counts[g] + 1 > max_size:
+                    continue
+                assignment[v] = g
+                counts[donor] -= 1
+                counts[g] += 1
+                moved = True
+                break
+            if moved:
+                break
+
+        if not moved:
+            g = int(np.argmin(counts))
+            v = int(donor_vertices[0])
+            assignment[v] = g
+            counts[donor] -= 1
+            counts[g] += 1
+
+    return assignment
+
+
 def _repair_balance(assignment, hyperedges, max_imbalance=0.05, seed=None, q=None):
     rng = np.random.default_rng(seed)
     assignment = np.asarray(assignment, dtype=np.int64).copy()
@@ -95,26 +152,43 @@ def refine_with_mcts(assignment, hyperedges, num_rollouts=16, depth=3, seed=None
     """Monte-Carlo style refinement via randomized move simulations."""
     rng = np.random.default_rng(seed)
     best = np.asarray(assignment, dtype=np.int64).copy()
+    base = best.copy()
     best_score = evaluate_kahypar_cut_value(best, hyperedges, [1.0] * len(hyperedges))[0]
     q = int(q) if q is not None else (int(best.max()) + 1 if best.size else 2)
-    _, counts, _, _ = _balance_limits(best, max_imbalance, q=q)
-    targets = _target_counts(len(best), q)
+    if best.size:
+        node_to_he = [[] for _ in range(best.size)]
+        boundary_vertices = set()
+        for e_idx, he in enumerate(hyperedges):
+            parts = {int(best[v]) for v in he if 0 <= v < best.size}
+            if len(parts) > 1:
+                for v in he:
+                    if 0 <= v < best.size:
+                        boundary_vertices.add(int(v))
+                    
+        boundary_vertices = np.array(sorted(boundary_vertices), dtype=np.int64)
+    else:
+        boundary_vertices = np.empty((0,), dtype=np.int64)
     if verbose:
         _, _, imb = _partition_summary(best, q=q)
         print(f"[refine:mcts] start rollouts={num_rollouts} depth={depth} cut={best_score} imb={imb:.4f}")
     for _ in range(max(1, int(num_rollouts))):
         cand = best.copy()
+        if boundary_vertices.size == 0:
+            break
         for _step in range(max(1, int(depth))):
-            v = int(rng.integers(0, len(cand)))
+            v = int(boundary_vertices[int(rng.integers(0, boundary_vertices.size))])
             old = int(cand[v])
-            new_g = int(rng.integers(0, q))
-            if new_g != old and counts[new_g] + 1 <= targets[new_g] and counts[old] - 1 >= targets[old]:
+            new_g = int(rng.integers(0, q - 1))
+            if new_g >= old:
+                new_g += 1
+            if new_g != old:
                 cand[v] = new_g
         score = evaluate_kahypar_cut_value(cand, hyperedges, [1.0] * len(hyperedges))[0]
         if score < best_score:
             best_score = score
             best = cand
-    best = _repair_balance(best, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+    if _partition_summary(best, q=q)[2] > max_imbalance:
+        best = _repair_balance_fast(best, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
     if verbose:
         _, _, imb = _partition_summary(best, q=q)
         print(f"[refine:mcts] done cut={best_score} imb={imb:.4f}")
@@ -126,19 +200,25 @@ def refine_with_evolution(assignment, hyperedges, population_size=8, generations
     rng = np.random.default_rng(seed)
     base = np.asarray(assignment, dtype=np.int64)
     q = int(q) if q is not None else (int(base.max()) + 1 if base.size else 2)
-    _, counts, _, _ = _balance_limits(base, max_imbalance, q=q)
+    base_score = evaluate_kahypar_cut_value(base, hyperedges, [1.0] * len(hyperedges))[0]
+    _, _, base_imb = _partition_summary(base, q=q)
+    low_cut_mode = base_score < 200
+    if low_cut_mode:
+        mutation_rate = min(float(mutation_rate), 0.01)
+        generations = min(int(generations), 3)
     if verbose:
-        _, _, imb = _partition_summary(base, q=q)
-        print(f"[refine:evolution] start pop={population_size} gens={generations} cut={evaluate_kahypar_cut_value(base, hyperedges, [1.0] * len(hyperedges))[0]} imb={imb:.4f}")
-    population = [base.copy()]
-    for _ in range(max(0, int(population_size) - 1)):
+        print(f"[refine:evolution] start pop={population_size} gens={generations} cut={base_score} imb={base_imb:.4f}")
+
+    population = [base.copy() for _ in range(max(1, int(population_size)))]
+    mutant_count = max(1, len(population) // 4)
+    for idx in range(1, min(len(population), mutant_count + 1)):
         cand = base.copy()
         mask = rng.random(cand.shape[0]) < float(mutation_rate)
-        new_values = rng.integers(0, q, size=int(mask.sum()))
         if mask.any():
-            cand[mask] = new_values
-            cand = _repair_balance(cand, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
-        population.append(cand)
+            cand[mask] = rng.integers(0, q, size=int(mask.sum()))
+            if _partition_summary(cand, q=q)[2] > max_imbalance:
+                cand = _repair_balance_fast(cand, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+        population[idx] = cand
 
     for _gen in range(max(1, int(generations))):
         scored = []
@@ -146,7 +226,10 @@ def refine_with_evolution(assignment, hyperedges, population_size=8, generations
             score = evaluate_kahypar_cut_value(cand, hyperedges, [1.0] * len(hyperedges))[0]
             scored.append((score, cand))
         scored.sort(key=lambda x: x[0])
-        elites = [cand.copy() for _, cand in scored[: max(1, len(scored) // 3)]]
+        if scored[0][0] > base_score:
+            scored = [(base_score, base.copy())] + scored
+        elites = [base.copy()]
+        elites.extend(cand.copy() for _, cand in scored[: max(1, len(scored) // 3)])
         next_population = elites[:]
         while len(next_population) < len(population):
             p1 = elites[int(rng.integers(0, len(elites)))]
@@ -155,16 +238,22 @@ def refine_with_evolution(assignment, hyperedges, population_size=8, generations
             mut_mask = rng.random(child.shape[0]) < float(mutation_rate)
             if mut_mask.any():
                 child[mut_mask] = rng.integers(0, q, size=int(mut_mask.sum()))
-                child = _repair_balance(child, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+                if _partition_summary(child, q=q)[2] > max_imbalance:
+                    child = _repair_balance_fast(child, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
             next_population.append(child)
         population = next_population
 
     scored = [(evaluate_kahypar_cut_value(cand, hyperedges, [1.0] * len(hyperedges))[0], cand) for cand in population]
     scored.sort(key=lambda x: x[0])
-    best = _repair_balance(scored[0][1], hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+    best_score, best = scored[0]
+    if best_score > base_score:
+        best = base.copy()
+        best_score = base_score
+    if _partition_summary(best, q=q)[2] > max_imbalance:
+        best = _repair_balance_fast(best, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
     if verbose:
         _, _, imb = _partition_summary(best, q=q)
-        print(f"[refine:evolution] done cut={scored[0][0]} imb={imb:.4f}")
+        print(f"[refine:evolution] done cut={best_score} imb={imb:.4f}")
     return best
 
 
@@ -183,6 +272,8 @@ def hybrid_refine_partition(
     evolution_generations=5,
     evolution_mutation=0.1,
     flow_passes=3,
+    skip_exploration_if_good=True,
+    good_cut_threshold=200.0,
 ):
     refined = np.asarray(assignment, dtype=np.int64).copy()
     if q is None:
@@ -193,17 +284,47 @@ def hybrid_refine_partition(
         _, counts, imb = _partition_summary(refined, q=q)
         print(f"[refine:hybrid] start q={q} cut={cut} counts={counts.tolist()} imb={imb:.4f}")
 
-    for round_idx in range(max(1, int(rounds))):
+    best = refined.copy()
+    best_cut = evaluate_kahypar_cut_value(best, hyperedges, [1.0] * len(hyperedges))[0]
+    best_imb = _partition_summary(best, q=q)[2]
+
+    def maybe_repair_and_accept(candidate):
+        nonlocal best, best_cut, best_imb
+        cand = np.asarray(candidate, dtype=np.int64).copy()
+        cand_cut = evaluate_kahypar_cut_value(cand, hyperedges, [1.0] * len(hyperedges))[0]
+        _, _, cand_imb = _partition_summary(cand, q=q)
+
+        if cand_imb > max_imbalance:
+            if cand_imb > max(0.15, 2.0 * float(max_imbalance)):
+                repaired = _repair_balance(cand, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+            else:
+                repaired = _repair_balance_fast(cand, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+            repaired_cut = evaluate_kahypar_cut_value(repaired, hyperedges, [1.0] * len(hyperedges))[0]
+            _, _, repaired_imb = _partition_summary(repaired, q=q)
+            if repaired_cut <= cand_cut:
+                cand, cand_cut, cand_imb = repaired, repaired_cut, repaired_imb
+
+        if cand_cut < best_cut or (cand_cut == best_cut and cand_imb <= best_imb):
+            best = cand.copy()
+            best_cut = float(cand_cut)
+            best_imb = float(cand_imb)
+            return cand
+
+        return best.copy()
+
+    good_initial = skip_exploration_if_good and best_cut <= float(good_cut_threshold) and best_imb <= float(max_imbalance)
+    effective_mode_cycle = ('flow',) if good_initial else tuple(mode_cycle)
+    effective_rounds = 1 if good_initial else max(1, int(rounds))
+    effective_flow_passes = 1 if good_initial else int(flow_passes)
+
+    for round_idx in range(effective_rounds):
         if verbose:
-            print(f"[refine:hybrid] round {round_idx + 1}/{int(rounds)}")
+            print(f"[refine:hybrid] round {round_idx + 1}/{int(effective_rounds)}")
 
-        # Initial exploration: MCTS -> evolutionary fusion -> flow refinement
-        stage_t0 = None
-
-        if 'mcts' in mode_cycle:
+        if 'mcts' in effective_mode_cycle:
             if verbose:
                 print("[refine:hybrid] stage=MCTS")
-            refined = refine_with_mcts(
+            candidate = refine_with_mcts(
                 refined,
                 hyperedges,
                 num_rollouts=mcts_rollouts,
@@ -213,12 +334,12 @@ def hybrid_refine_partition(
                 q=q,
                 verbose=verbose,
             )
+            refined = maybe_repair_and_accept(candidate)
 
-        if 'evolution' in mode_cycle:
+        if 'evolution' in effective_mode_cycle:
             if verbose:
                 print("[refine:hybrid] stage=Evolution")
-            # seed the population with the MCTS result by directly evolving from it
-            refined = refine_with_evolution(
+            candidate = refine_with_evolution(
                 refined,
                 hyperedges,
                 population_size=evolution_population,
@@ -229,26 +350,31 @@ def hybrid_refine_partition(
                 q=q,
                 verbose=verbose,
             )
+            refined = maybe_repair_and_accept(candidate)
 
-        if 'flow' in mode_cycle:
+        if 'flow' in effective_mode_cycle:
             if verbose:
                 print("[refine:hybrid] stage=Flow")
-            refined = refine_with_flow_local_search(
+            candidate = refine_with_flow_local_search(
                 refined,
                 hyperedges,
-                max_passes=flow_passes,
+                max_passes=effective_flow_passes,
                 max_imbalance=max_imbalance,
                 q=q,
                 verbose=verbose,
             )
+            refined = maybe_repair_and_accept(candidate)
 
-        refined = _repair_balance(refined, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+        if _partition_summary(refined, q=q)[2] > max_imbalance:
+            refined = _repair_balance_fast(refined, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+        refined = maybe_repair_and_accept(refined)
         if verbose:
-            cut, _ = evaluate_kahypar_cut_value(refined, hyperedges, [1.0] * len(hyperedges))
-            _, counts, imb = _partition_summary(refined, q=q)
-            print(f"[refine:hybrid] round_done cut={cut} counts={counts.tolist()} imb={imb:.4f}")
+            print(f"[refine:hybrid] round_done cut={best_cut} counts={_partition_summary(best, q=q)[1].tolist()} imb={best_imb:.4f}")
 
-    refined = _repair_balance(refined, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+    refined = best.copy()
+    if _partition_summary(refined, q=q)[2] > max_imbalance:
+        refined = _repair_balance_fast(refined, hyperedges, max_imbalance=max_imbalance, seed=seed, q=q)
+    refined = maybe_repair_and_accept(refined)
     if verbose:
         cut, _ = evaluate_kahypar_cut_value(refined, hyperedges, [1.0] * len(hyperedges))
         _, counts, imb = _partition_summary(refined, q=q)

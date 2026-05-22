@@ -676,50 +676,47 @@ def greedy_refine_hypergraph_incremental(
 
 def greedy_initial_hypergraph_partition(
     hyperedges: list,
-    num_nodes: int,
-    q: int,
+    vertex_weights,
+    k: int,
     hyperedge_weights: list = None,
-    max_imbalance: float = 0.05,
+    epsilon: float = 0.03,
     seed: int = None,
 ):
     """
-    Build a balanced initial q-way partition for a hypergraph using a simple
-    greedy vertex placement heuristic.
+    Build a balanced initial k-way partition for a hypergraph using a greedy
+    vertex placement heuristic that respects vertex weights.
 
     The goal is not to mimic KaHyPar's full machinery, but to provide a
     deterministic, self-contained coarse assignment that can be refined later.
     """
     rng = np.random.default_rng(seed)
+    vertex_weights = np.asarray(vertex_weights, dtype=float)
+    num_nodes = int(vertex_weights.shape[0])
+    k = int(k)
     if hyperedge_weights is None:
         hyperedge_weights = [1.0] * len(hyperedges)
 
     node_to_he = [[] for _ in range(num_nodes)]
-    node_weight = np.zeros(num_nodes, dtype=float)
+    node_degree = np.zeros(num_nodes, dtype=float)
     for e_idx, he in enumerate(hyperedges):
         w = float(hyperedge_weights[e_idx])
         for v in he:
             if 0 <= v < num_nodes:
                 node_to_he[v].append(e_idx)
-                node_weight[v] += w
+                node_degree[v] += w
 
     order = np.arange(num_nodes)
     # High-degree / high-weight vertices first; break ties randomly.
     tie_breaker = rng.random(num_nodes)
-    order = np.lexsort((tie_breaker, -node_weight))
+    order = np.lexsort((tie_breaker, -vertex_weights, -node_degree))
 
     assignment = np.full(num_nodes, -1, dtype=np.int64)
-    group_sizes = np.zeros(q, dtype=np.int64)
-    ideal = num_nodes / float(q)
-    max_size = int(np.ceil(ideal * (1.0 + max_imbalance)))
-
-    if num_nodes >= q:
-        seed_nodes = order[:q]
-        for g, v in enumerate(seed_nodes):
-            assignment[v] = g
-            group_sizes[g] += 1
-        remaining_order = order[q:]
-    else:
-        remaining_order = order
+    group_weights = np.zeros(k, dtype=float)
+    total_weight = float(vertex_weights.sum())
+    ideal_weight = total_weight / float(k) if k > 0 else 0.0
+    max_weight = ideal_weight * (1.0 + float(epsilon))
+    if max_weight <= 0.0:
+        max_weight = float("inf")
 
     def boundary_cost(v, g):
         cost = 0.0
@@ -741,13 +738,13 @@ def greedy_initial_hypergraph_partition(
                 cost -= w
         return cost
 
-    for v in remaining_order:
+    for v in order:
         best_group = None
         best_cost = None
-        candidates = np.arange(q)
+        candidates = np.arange(k)
         rng.shuffle(candidates)
         for g in candidates:
-            if group_sizes[g] + 1 > max_size:
+            if group_weights[g] + float(vertex_weights[v]) > max_weight:
                 continue
             cost = boundary_cost(v, g)
             if best_cost is None or cost < best_cost:
@@ -755,10 +752,10 @@ def greedy_initial_hypergraph_partition(
                 best_group = g
 
         if best_group is None:
-            best_group = int(np.argmin(group_sizes))
+            best_group = int(np.argmin(group_weights))
 
         assignment[v] = best_group
-        group_sizes[best_group] += 1
+        group_weights[best_group] += float(vertex_weights[v])
 
     return assignment
 

@@ -109,119 +109,147 @@ def _jaccard_similarity(edge_set_a, edge_set_b):
     return float(len(inter)) / float(len(union))
 
 
-def _lsh_bucketize_vertices(hyperedges, num_nodes, target_buckets=None, num_planes=12, num_tables=3, seed=None, jaccard_threshold=0.15, num_hashes=64, verbose=False):
-    """Pre-coarsen vertices with MinHash signatures over incident hyperedge sets.
+def _lsh_groups_from_incident_sets(
+    incident_edge_sets,
+    num_hashes=128,
+    num_bands=32,
+    rows_per_band=4,
+    target_buckets=200,
+    threshold=0.5,
+    min_threshold=0.1,
+    seed=None,
+    verbose=False,
+):
+    """Build merge groups via standard MinHash-LSH banding plus exact Jaccard filtering."""
+    num_vertices = len(incident_edge_sets)
+    if num_vertices == 0:
+        return []
 
-    Vertices are bucketed by LSH bands of their MinHash signatures, then we
-    only merge vertices whose exact Jaccard similarity over incident hyperedge
-    sets exceeds `jaccard_threshold`.
-    """
-    rng = np.random.default_rng(seed)
+    num_hashes = max(1, int(num_hashes))
+    num_bands = max(1, int(num_bands))
+    rows_per_band = max(1, int(rows_per_band))
+    target_buckets = max(1, int(target_buckets))
+    min_threshold = float(min_threshold)
+
+    # Keep the MinHash layout consistent with requested banding.
+    required_hashes = num_bands * rows_per_band
+    if num_hashes < required_hashes:
+        num_hashes = required_hashes
+
+    signatures = _minhash_signatures(incident_edge_sets, num_hashes=num_hashes, seed=seed)
+    num_bucket_slots = max(
+        128,
+        min(num_vertices, int(np.ceil(float(num_vertices) / max(1.0, float(target_buckets) / float(num_bands))))),
+    )
+
+    def _compute_groups(thr):
+        # 1) Band buckets via second-level hashing.
+        buckets = {}
+        max_band_rows = signatures.shape[1]
+        for band_idx in range(num_bands):
+            start = band_idx * rows_per_band
+            end = start + rows_per_band
+            if end > max_band_rows:
+                break
+            for v in range(num_vertices):
+                band_slice = tuple(int(x) for x in signatures[v, start:end])
+                band_hash = hash((band_idx, band_slice)) % num_bucket_slots
+                key = (band_idx, band_hash)
+                buckets.setdefault(key, []).append(v)
+
+        # 2) Candidate set from all intra-bucket pairs.
+        candidates = set()
+        for verts in buckets.values():
+            if len(verts) <= 1:
+                continue
+            unique_verts = sorted(set(verts))
+            for i in range(len(unique_verts)):
+                u = unique_verts[i]
+                for j in range(i + 1, len(unique_verts)):
+                    v = unique_verts[j]
+                    candidates.add((u, v))
+
+        # 3) Union-find using exact Jaccard thresholding.
+        parent = np.arange(num_vertices, dtype=np.int64)
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x, y):
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[ry] = rx
+
+        hits = 0
+        checks = 0
+        for u, v in candidates:
+            checks += 1
+            sim = _jaccard_similarity(incident_edge_sets[u], incident_edge_sets[v])
+            if sim >= thr:
+                hits += 1
+                union(u, v)
+
+        comp = {}
+        for v in range(num_vertices):
+            root = find(v)
+            comp.setdefault(root, []).append(v)
+
+        groups_local = list(comp.values())
+        return groups_local, len(candidates), checks, hits
+
+    cur_threshold = float(threshold)
+    groups, candidate_pairs, checks, hits = _compute_groups(cur_threshold)
+
+    # 4) Optional threshold relaxation toward target bucket count.
+    while len(groups) > target_buckets and cur_threshold > min_threshold:
+        cur_threshold = max(min_threshold, cur_threshold * 0.8)
+        groups, candidate_pairs, checks, hits = _compute_groups(cur_threshold)
+
+    if verbose and checks > 0:
+        hit_ratio = float(hits) / float(checks)
+        print(
+            f"[kahypar_like] LSH/Jaccard threshold sanity: threshold={cur_threshold:.3f}, "
+            f"hit_ratio={hit_ratio:.3f}, candidates={candidate_pairs}, buckets={len(groups)}, target={target_buckets}"
+        )
+
+    return groups
+
+
+def _lsh_bucketize_vertices(
+    hyperedges,
+    num_nodes,
+    target_buckets=None,
+    num_planes=4,
+    num_tables=32,
+    seed=None,
+    jaccard_threshold=0.1,
+    num_hashes=128,
+    verbose=False,
+):
+    """Pre-coarsen vertices using MinHash/LSH over incident hyperedge sets."""
     if num_nodes == 0:
         return np.arange(0, dtype=np.int64), []
 
     incident_edge_sets = _vertex_incident_edge_sets(hyperedges, num_nodes)
-    signatures = _minhash_signatures(incident_edge_sets, num_hashes=num_hashes, seed=seed)
-
-    tables = max(8, int(num_tables))
-    planes_per_table = max(1, int(num_planes))
-    if target_buckets is not None and num_nodes > 0:
-        # Keep band count and signature size in a sane range relative to target.
-        expected_bits = int(np.clip(np.ceil(np.log2(max(2, num_nodes / max(1, int(target_buckets))))), 4, 16))
-        planes_per_table = max(planes_per_table, expected_bits)
-        tables = max(tables, 8)
-
-    # LSH banding: each table contributes candidate buckets; vertices only need
-    # to collide in *one* band to be considered for an exact Jaccard check.
-    band_width = max(1, int(np.ceil(signatures.shape[1] / float(tables))))
-    candidate_buckets = {}
-    for table_idx in range(tables):
-        start = table_idx * band_width
-        end = min(signatures.shape[1], start + band_width)
-        if start >= end:
-            continue
-        band = signatures[:, start:end]
-        for v in range(num_nodes):
-            key = (table_idx,) + tuple(int(x) for x in band[v])
-            candidate_buckets.setdefault(key, []).append(v)
-
-    # Union-find over candidate pairs produced by any band bucket.
-    parent = np.arange(num_nodes, dtype=np.int64)
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x, y):
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            parent[ry] = rx
-
-    threshold_checks = 0
-    threshold_hits = 0
-    candidate_pairs = 0
-    threshold = float(jaccard_threshold)
-
-    candidate_pairs_set = set()
-
-    for verts in candidate_buckets.values():
-        if len(verts) < 2:
-            continue
-        # Generate all unique pairs from the bucket and add to a global set
-        for i in range(len(verts)):
-            for j in range(i + 1, len(verts)):
-                u, v = verts[i], verts[j]
-                candidate_pairs_set.add(tuple(sorted((u, v))))
-
-    # Now, iterate through all unique candidate pairs for exact Jaccard check
-    for u, v in candidate_pairs_set:
-        candidate_pairs += 1
-        threshold_checks += 1
-        sim = _jaccard_similarity(incident_edge_sets[u], incident_edge_sets[v])
-        if sim >= threshold:
-            threshold_hits += 1
-            union(u, v)
-
-    # Optional fallback: if exact Jaccard produced almost no merges, relax the
-    # threshold adaptively down to a floor instead of leaving everything singleton.
-    if target_buckets is not None:
-        target_buckets = max(1, int(target_buckets))
-    merge_groups = {}
-    for v in range(num_nodes):
-        root = find(v)
-        merge_groups.setdefault(root, []).append(v)
-
-    if len(merge_groups) > max(1, int(target_buckets) if target_buckets is not None else num_nodes) * 2:
-        relax_threshold = threshold
-        while relax_threshold > 0.03 and len(merge_groups) > max(1, int(target_buckets) if target_buckets is not None else num_nodes) * 2:
-            relax_threshold = max(0.03, relax_threshold * 0.8)
-            parent = np.arange(num_nodes, dtype=np.int64)
-            for u, v in candidate_pairs_set: # Re-evaluate with relaxed threshold
-                sim = _jaccard_similarity(incident_edge_sets[u], incident_edge_sets[v])
-                if sim >= relax_threshold:
-                    union(u, v)
-            merge_groups = {}
-            for v in range(num_nodes):
-                root = find(v)
-                merge_groups.setdefault(root, []).append(v)
-        threshold = relax_threshold
-
-    groups = list(merge_groups.values())
+    groups = _lsh_groups_from_incident_sets(
+        incident_edge_sets,
+        num_hashes=num_hashes,
+        num_bands=max(1, int(num_tables)),
+        rows_per_band=max(1, int(num_planes)),
+        target_buckets=max(1, int(target_buckets)) if target_buckets is not None else max(1, int(num_nodes // 4)),
+        threshold=float(jaccard_threshold),
+        min_threshold=0.02,
+        seed=seed,
+        verbose=verbose,
+    )
 
     original_to_bucket = np.empty(num_nodes, dtype=np.int64)
     for idx, verts in enumerate(groups):
         for v in verts:
             original_to_bucket[v] = idx
-
-    if verbose and threshold_checks > 0:
-        merge_ratio = float(threshold_hits) / float(threshold_checks)
-        if merge_ratio < 0.05 or merge_ratio > 0.95 or len(groups) > max(1, int(target_buckets) * 2 if target_buckets is not None else num_nodes):
-            print(
-                f"[kahypar_like] LSH/Jaccard threshold sanity: threshold={float(threshold):.3f}, "
-                f"hit_ratio={merge_ratio:.3f}, candidates={candidate_pairs}, buckets={len(groups)}, target={target_buckets}"
-            )
 
     return original_to_bucket, groups
 
@@ -262,176 +290,162 @@ def _graph_to_hyperedges_from_clique(coarse_graph):
     return hyperedges
 
 
-def coarsen_kahypar_like(hyperedges, num_nodes, q=2, coarsen_to=10, verbose=False, seed=None, lsh_planes=4, lsh_tables=16):
-    """Heap-based KaHyPar-like hypergraph contraction.
+def coarsen_kahypar_like(hyperedges, num_nodes, q=2, coarsen_to=10, verbose=False, seed=None, lsh_planes=4, lsh_tables=32, use_lsh=False):
+    """Fast KaHyPar-like coarsening with batched heavy-edge matching.
 
-    The coarsener keeps contracting the best-rated pair until the coarse graph
-    reaches `coarsen_to` or no valid pair remains. Pair ratings are defined as:
-        sum_{e contains u,v} weight(e) / (|e| - 1)
-    and stale heap entries are discarded lazily.
+    The implementation avoids a global per-pair priority queue. Instead it runs
+    repeated matching rounds:
+    - visit alive vertices in random order,
+    - pick the best unmatched neighbor by heavy-edge rating,
+    - contract all selected pairs in a batch using a remap array,
+    - rebuild coarse hyperedges for the next round.
     """
     rng = np.random.default_rng(seed)
-    _ = rng  # reserved for future community detection / tie-breaking
 
-    # LSH preprocessing: bucket similar vertices together first.
-    lsh_map, lsh_groups = _lsh_bucketize_vertices(
-        hyperedges,
-        num_nodes,
-        target_buckets=max(1, int(coarsen_to) * 4),
-        num_planes=lsh_planes,
-        num_tables=lsh_tables,
-        seed=seed,
-        verbose=verbose,
-    )
-    if verbose:
-        print(f"[kahypar_like] LSH pre-coarsen: {num_nodes} -> {len(lsh_groups)} buckets")
+    if use_lsh:
+        lsh_map, lsh_groups = _lsh_bucketize_vertices(
+            hyperedges,
+            num_nodes,
+            target_buckets=max(1, int(coarsen_to) * 4),
+            num_planes=lsh_planes,
+            num_tables=lsh_tables,
+            seed=seed,
+            verbose=verbose,
+        )
+        if verbose:
+            print(f"[kahypar_like] LSH pre-coarsen: {num_nodes} -> {len(lsh_groups)} buckets")
+        current_hyperedges = _rebuild_hyperedges_from_groups(hyperedges, lsh_map, len(lsh_groups))
+        current_groups = [list(g) for g in lsh_groups]
+    else:
+        current_hyperedges = [list(dict.fromkeys(he)) for he in hyperedges if len(set(he)) > 1]
+        current_groups = [[i] for i in range(num_nodes)]
 
-    pre_hyperedges = _rebuild_hyperedges_from_groups(hyperedges, lsh_map, len(lsh_groups))
+    current_n = len(current_groups)
+    if current_n == 0:
+        empty_graph = torch.sparse_coo_tensor(
+            torch.empty((2, 0), dtype=torch.long),
+            torch.empty((0,), dtype=torch.float32),
+            (0, 0),
+        ).coalesce()
+        return {
+            'coarse_graph': empty_graph,
+            'coarse_node_weights': torch.empty((0,), dtype=torch.float32),
+            'coarse_groups': [],
+            'original_to_coarse': np.empty((0,), dtype=np.int64),
+            'coarse_hyperedges': [],
+            'initial_assignment': np.empty((0,), dtype=np.int64),
+        }
 
-    # dynamic coarse representation
-    alive = {i: True for i in range(len(lsh_groups))}
-    groups = {i: list(lsh_groups[i]) for i in range(len(lsh_groups))}
-    next_node_id = len(lsh_groups)
+    target_coarse_size = max(1, int(coarsen_to))
 
-    edge_vertices = {eid: set(he) for eid, he in enumerate(pre_hyperedges) if len(he) > 1}
-    edge_weights = {eid: 1.0 for eid in edge_vertices}
-    vertex_to_edges = {i: set() for i in range(len(lsh_groups))}
-    for eid, verts in edge_vertices.items():
-        for v in verts:
-            if v < len(lsh_groups):
-                vertex_to_edges.setdefault(v, set()).add(eid)
+    def build_incidence(hyperedge_list, vertex_count):
+        vertex_to_edges = [set() for _ in range(vertex_count)]
+        edge_vertices = []
+        edge_weights = []
+        for eid, he in enumerate(hyperedge_list):
+            verts = []
+            seen = set()
+            for v in he:
+                if 0 <= v < vertex_count and v not in seen:
+                    verts.append(int(v))
+                    seen.add(int(v))
+            if len(verts) > 1:
+                edge_vertices.append(verts)
+                edge_weights.append(1.0)
+                for v in verts:
+                    vertex_to_edges[v].add(len(edge_vertices) - 1)
+        return vertex_to_edges, edge_vertices, edge_weights
 
-    pair_rating = {}
-    heap = []
+    round_id = 0
+    while current_n > target_coarse_size:
+        round_id += 1
+        alive = np.ones(current_n, dtype=bool)
+        matched = np.zeros(current_n, dtype=bool)
+        partner = np.full(current_n, -1, dtype=np.int64)
+        vertex_to_edges, edge_vertices, edge_weights = build_incidence(current_hyperedges, current_n)
 
-    for eid, verts in edge_vertices.items():
-        verts_list = list(verts)
-        if len(verts_list) < 2:
-            continue
-        contribution = float(edge_weights[eid]) / float(len(verts_list) - 1)
-        for i in range(len(verts_list)):
-            for j in range(i + 1, len(verts_list)):
-                u, v = verts_list[i], verts_list[j]
-                a, b = (u, v) if u < v else (v, u)
-                pair_rating[(a, b)] = pair_rating.get((a, b), 0.0) + contribution
+        order = rng.permutation(current_n)
+        pair_count = 0
 
-    for (u, v), rating in list(pair_rating.items()):
-        _push_pair(heap, pair_rating, u, v, rating)
-
-    def updateVertexPair(u, v):
-        rating = _evaluate_pair_rating(u, v, alive, vertex_to_edges, edge_vertices, edge_weights)
-        _push_pair(heap, pair_rating, u, v, rating)
-        return rating
-
-    def invalidate_vertex_pairs(vertex):
-        for other in list(alive.keys()):
-            if other == vertex or not alive.get(other, False):
+        for u in order:
+            if not alive[u] or matched[u]:
                 continue
-            a, b = (vertex, other) if vertex < other else (other, vertex)
-            if (a, b) in pair_rating:
-                pair_rating.pop((a, b), None)
 
-    def contract_pair(u, v):
-        nonlocal next_node_id
-        w = next_node_id
-        next_node_id += 1
-
-        groups[w] = groups.get(u, []) + groups.get(v, [])
-        alive[u] = False
-        alive[v] = False
-        alive[w] = True
-
-        incident_eids = set(vertex_to_edges.get(u, set())) | set(vertex_to_edges.get(v, set()))
-        affected_vertices = set()
-
-        for eid in incident_eids:
-            verts = edge_vertices.get(eid)
-            if not verts:
-                continue
-            if u not in verts and v not in verts:
-                continue
-            new_verts = set(verts)
-            new_verts.discard(u)
-            new_verts.discard(v)
-            new_verts.add(w)
-            edge_vertices[eid] = new_verts
-
-            vertex_to_edges.setdefault(w, set()).add(eid)
-            if u in vertex_to_edges:
-                vertex_to_edges[u].discard(eid)
-            if v in vertex_to_edges:
-                vertex_to_edges[v].discard(eid)
-
-            affected_vertices.update(new_verts)
-
-        # Remove singleton hyperedges and keep edge maps compact.
-        for eid, verts in list(edge_vertices.items()):
-            if len(verts) <= 1:
-                for x in list(verts):
-                    if x in vertex_to_edges:
-                        vertex_to_edges[x].discard(eid)
-                edge_vertices.pop(eid, None)
-                edge_weights.pop(eid, None)
-
-        # Invalidate pairs touching u/v, then refresh only pairs touched by the contraction.
-        for old in (u, v):
-            for other in list(alive.keys()):
-                if not alive.get(other, False) or other == old:
+            ratings = {}
+            for eid in vertex_to_edges[u]:
+                verts = edge_vertices[eid]
+                if len(verts) < 2:
                     continue
-                a, b = (old, other) if old < other else (other, old)
-                pair_rating.pop((a, b), None)
+                contrib = float(edge_weights[eid]) / float(len(verts) - 1)
+                for v in verts:
+                    if v != u and alive[v] and not matched[v]:
+                        ratings[v] = ratings.get(v, 0.0) + contrib
 
-        neighbor_vertices = set()
-        for eid in vertex_to_edges.get(w, set()):
-            for x in edge_vertices.get(eid, set()):
-                if x != w and alive.get(x, False):
-                    neighbor_vertices.add(x)
-
-        for x in neighbor_vertices:
-            updateVertexPair(w, x)
-
-        # Refresh the pairs for vertices adjacent to the contraction boundary.
-        for x in affected_vertices:
-            if x == w or not alive.get(x, False):
+            if not ratings:
                 continue
-            updateVertexPair(w, x)
+
+            v = max(ratings.items(), key=lambda item: (item[1], -item[0]))[0]
+            if ratings[v] <= 0.0 or matched[v] or not alive[v]:
+                continue
+
+            matched[u] = True
+            matched[v] = True
+            partner[u] = v
+            partner[v] = u
+            pair_count += 1
+
+        if pair_count == 0:
+            break
+
+        remap = np.full(current_n + pair_count, -1, dtype=np.int64)
+        new_groups = []
+        new_id = 0
+        used = np.zeros(current_n, dtype=bool)
+
+        for u in range(current_n):
+            if not alive[u] or used[u]:
+                continue
+            v = partner[u]
+            if v != -1 and used[v]:
+                continue
+            if v != -1:
+                used[u] = True
+                used[v] = True
+                remap[u] = new_id
+                remap[v] = new_id
+                new_groups.append(current_groups[u] + current_groups[v])
+            else:
+                used[u] = True
+                remap[u] = new_id
+                new_groups.append(current_groups[u])
+            new_id += 1
+
+        new_hyperedges = []
+        for he in current_hyperedges:
+            mapped = []
+            seen = set()
+            for v in he:
+                nv = remap[v]
+                if nv < 0 or nv in seen:
+                    continue
+                mapped.append(int(nv))
+                seen.add(int(nv))
+            if len(mapped) > 1:
+                new_hyperedges.append(mapped)
 
         # if verbose:
-            # print(f"[kahypar_like] contract ({u}, {v}) -> {w}, alive={sum(1 for x in alive if alive[x])}")
+        #     print(f"[matching] round={round_id} alive={current_n} pairs={pair_count} -> {new_id}")
 
-        return w
-
-    while True:
-        current_alive = [v for v in alive if alive[v]]
-        if len(current_alive) <= max(1, int(coarsen_to)):
+        if new_id == current_n:
             break
 
-        chosen = None
-        while heap:
-            neg_rating, u, v = heapq.heappop(heap)
-            if not (alive.get(u, False) and alive.get(v, False)):
-                continue
-            key = (u, v)
-            cur = pair_rating.get(key)
-            if cur is None:
-                continue
-            if abs(cur + neg_rating) > 1e-12:
-                continue
-            chosen = (u, v, cur)
-            break
+        current_hyperedges = new_hyperedges
+        current_groups = new_groups
+        current_n = new_id
 
-        if chosen is None:
-            break
-
-        u, v, rating = chosen
-        # matching-style contraction: immediately invalidate the pair and contract it.
-        invalidate_vertex_pairs(u)
-        invalidate_vertex_pairs(v)
-        contract_pair(u, v)
-
-    alive_nodes = [v for v in alive if alive[v]]
-    coarse_groups = [groups[v] for v in alive_nodes]
-    coarse_index = {node: idx for idx, node in enumerate(alive_nodes)}
+    coarse_groups = current_groups
+    coarse_hyperedges = current_hyperedges
+    coarse_index = {node: idx for idx, node in enumerate(range(len(coarse_groups)))}
 
     original_to_coarse = np.empty(num_nodes, dtype=np.int64)
     for idx, members in enumerate(coarse_groups):
@@ -439,27 +453,15 @@ def coarsen_kahypar_like(hyperedges, num_nodes, q=2, coarsen_to=10, verbose=Fals
             if member < num_nodes:
                 original_to_coarse[member] = idx
 
-    coarse_hyperedges = []
-    for verts in edge_vertices.values():
-        mapped = []
-        seen = set()
-        for v in verts:
-            if v in coarse_index:
-                cv = coarse_index[v]
-                if cv not in seen:
-                    mapped.append(cv)
-                    seen.add(cv)
-        if len(mapped) > 1:
-            coarse_hyperedges.append(mapped)
-
     coarse_graph = build_clique_expanded_graph(coarse_hyperedges, num_nodes=len(coarse_groups), normalize_weight=True)
     coarse_node_weights = torch.tensor([len(g) for g in coarse_groups], dtype=torch.float32)
 
     initial_assignment = greedy_initial_hypergraph_partition(
         coarse_hyperedges,
-        len(coarse_groups),
+        coarse_node_weights.cpu().numpy(),
         q,
         hyperedge_weights=[1.0] * len(coarse_hyperedges),
+        epsilon=0.03,
         seed=seed,
     )
 
@@ -473,94 +475,222 @@ def coarsen_kahypar_like(hyperedges, num_nodes, q=2, coarsen_to=10, verbose=Fals
     }
 
 
-def coarsen_fem_refine_kahypar(hyperedges, num_nodes, q=2, coarsen_to=10, num_trials=1, num_steps=10, dev='cpu', verbose=False, lsh_planes=8, lsh_tables=2):
-    """QUBO matching coarsening followed by the same coarse greedy initializer.
+def coarsen_fem_refine_kahypar(hyperedges, num_nodes, q=2, coarsen_to=10, num_trials=1, num_steps=10, dev='cpu', verbose=False, lsh_planes=4, lsh_tables=32):
+    """Edge-variable QUBO coarsening (reverted implementation).
 
-    The intent of this mode is to test the contraction stage and compare the
-    resulting coarse cut against `kahypar_like` without running any external
-    KaHyPar refinement.
+    Build candidate contraction edges from hyperedges, form a sparse
+    QUBO over edge-selection variables, solve with FEM.customize and
+    greedily apply non-conflicting selected contractions in batches until
+    target `coarsen_to` is reached. This avoids building dense NxN matrices.
     """
-    from itertools import combinations
+    from FEM import FEM as _FEM
 
-    from FEM.cyclic_expansion import solve_qubo_with_fem
+    rng = np.random.default_rng(0)
+    target_coarse = max(1, int(coarsen_to))
 
-    wprime = {}
-    for he in hyperedges:
-        verts = sorted(set(he))
-        for u, v in combinations(verts, 2):
-            key = (int(u), int(v))
-            wprime[key] = wprime.get(key, 0.0) + 1.0
+    # Parameters to bound QUBO size and penalties.
+    max_qubo_vars = 20000
+    conflict_scale = 1.2
 
-    candidate_edges = list(wprime.keys())
-    if not candidate_edges:
-        original_to_coarse = np.arange(num_nodes, dtype=np.int64)
-        coarse_groups = [[i] for i in range(num_nodes)]
-    else:
-        s = len(candidate_edges)
-        Q = np.zeros((s, s), dtype=float)
-        w_vec = np.array([wprime[e] for e in candidate_edges], dtype=float)
+    # current grouping: initially each original vertex is its own group
+    current_groups = [[i] for i in range(num_nodes)]
+    current_hyperedges = [list(dict.fromkeys(he)) for he in hyperedges if len(set(he)) > 1]
+    current_n = len(current_groups)
 
-        for i in range(s):
-            Q[i, i] -= w_vec[i]
+    def build_pair_affinity(hyperedge_list, vertex_count):
+        pair_aff = {}
+        for he in hyperedge_list:
+            verts = [int(v) for v in he if 0 <= v < vertex_count]
+            verts = sorted(set(verts))
+            if len(verts) <= 1:
+                continue
+            contrib = 1.0 / float(len(verts) - 1)
+            for i in range(len(verts)):
+                for j in range(i + 1, len(verts)):
+                    u = verts[i]
+                    v = verts[j]
+                    key = (u, v) if u < v else (v, u)
+                    pair_aff[key] = pair_aff.get(key, 0.0) + contrib
+        return pair_aff
 
-        P = max(1.0, float(w_vec.sum())) * 10.0
-        incid = {v: [] for v in range(num_nodes)}
-        for idx, (u, v) in enumerate(candidate_edges):
-            incid[u].append(idx)
-            incid[v].append(idx)
+    round_id = 0
+    while current_n > target_coarse:
+        round_id += 1
+        pair_affinity = build_pair_affinity(current_hyperedges, current_n)
+        if not pair_affinity:
+            break
 
-        for _, idxs in incid.items():
-            for i in idxs:
-                Q[i, i] += P - 2.0 * P
-            for i in range(len(idxs)):
-                for j in range(i + 1, len(idxs)):
-                    a = idxs[i]
-                    b = idxs[j]
-                    Q[a, b] += 2.0 * P
-                    Q[b, a] += 2.0 * P
+        # Pick top candidate pairs by affinity up to cap
+        sorted_pairs = sorted(pair_affinity.items(), key=lambda kv: -kv[1])
+        m = min(len(sorted_pairs), max(1, int(min(len(sorted_pairs), max_qubo_vars))))
+        candidates = sorted_pairs[:m]
 
-        assign = solve_qubo_with_fem(Q, num_trials=max(1, num_trials), num_steps=max(10, num_steps), dev=dev)
+        var_index = {}
+        vars_u = []
+        vars_v = []
+        weights = []
+        for idx, ((u, v), w) in enumerate(candidates):
+            var_index[(u, v)] = idx
+            vars_u.append(int(u))
+            vars_v.append(int(v))
+            weights.append(float(w))
 
-        matched = set()
-        coarse_groups = []
-        original_to_coarse = np.full(num_nodes, -1, dtype=np.int64)
-        next_c = 0
-        for idx, val in enumerate(assign):
-            if int(val) == 1:
-                u, v = candidate_edges[idx]
-                if u in matched or v in matched:
+        m = len(weights)
+        if m == 0:
+            break
+
+        max_w = max(weights)
+        penalty = max(1e-3, max_w) * conflict_scale
+
+        # Build sparse QUBO: diagonal h_i = -w_i (reward), conflicts J_ij = penalty
+        q_rows = []
+        q_cols = []
+        q_vals = []
+
+        # diagonals
+        for i, w in enumerate(weights):
+            q_rows.append(i)
+            q_cols.append(i)
+            q_vals.append(-float(w))
+
+        # conflict pairs (edges sharing a vertex) -> positive quadratic penalty
+        vertex_to_vars = {}
+        for i, (u, v) in enumerate(zip(vars_u, vars_v)):
+            vertex_to_vars.setdefault(u, []).append(i)
+            vertex_to_vars.setdefault(v, []).append(i)
+
+        # enumerate conflicts (i<j) and add J_ij to both symmetric positions half value
+        conflicts_added = 0
+        for var_list in vertex_to_vars.values():
+            if len(var_list) <= 1:
+                continue
+            for a in range(len(var_list)):
+                for b in range(a + 1, len(var_list)):
+                    i = var_list[a]
+                    j = var_list[b]
+                    # add penalty to (i,j) and (j,i) as half-values so x^T Q x sums to J_ij x_i x_j
+                    q_rows.extend([i, j])
+                    q_cols.extend([j, i])
+                    q_vals.extend([penalty / 2.0, penalty / 2.0])
+                    conflicts_added += 1
+
+        Q_sparse = torch.sparse_coo_tensor(
+            torch.tensor([q_rows, q_cols], dtype=torch.long) if q_rows else torch.empty((2, 0), dtype=torch.long),
+            torch.tensor(q_vals, dtype=torch.float32) if q_vals else torch.empty((0,), dtype=torch.float32),
+            (m, m),
+        ).coalesce()
+
+        # FEM expected and inference functions for binary selection variables
+        def _extract_binary_state(p: torch.Tensor) -> torch.Tensor:
+            if p.dim() == 3:
+                if p.shape[-1] != 2:
+                    raise ValueError(f"Unexpected p shape for edge-QUBO: {tuple(p.shape)}")
+                return p[..., 1]
+            if p.dim() == 2:
+                if p.shape[1] == 2 and (p.shape[0] % m) == 0:
+                    return p.reshape(-1, m, 2)[..., 1]
+                if p.shape[1] == m:
+                    return p
+            if p.dim() == 1:
+                return p.unsqueeze(0)
+            raise ValueError(f"Unexpected p shape for edge-QUBO: {tuple(p.shape)}")
+
+        def expected_qubo(_, p: torch.Tensor) -> torch.Tensor:
+            x = _extract_binary_state(p)
+            Q = Q_sparse.to(device=p.device, dtype=p.dtype)
+            pair_energy = (torch.sparse.mm(Q, x.T).T * x).sum(dim=1)
+            return pair_energy
+
+        def inference_qubo(_, p: torch.Tensor):
+            x = _extract_binary_state(p)
+            if x.dim() == 1:
+                x = x.unsqueeze(0)
+            labels = (x >= 0.5).to(torch.long)
+            config = torch.zeros((labels.shape[0], labels.shape[1], 2), dtype=p.dtype, device=p.device)
+            config[..., 1] = labels.to(p.dtype)
+            config[..., 0] = 1.0 - config[..., 1]
+            return config, torch.zeros(config.shape[0], device=config.device)
+
+        fem = _FEM()
+        dummy = torch.zeros((m, m), dtype=torch.float32)
+        fem.set_up_problem(m, 0, 'customize', dummy, q=2, customize_expected_func=expected_qubo, customize_infer_func=inference_qubo)
+        fem.set_up_solver(max(1, num_trials), max(10, num_steps), anneal='lin', dev=dev, q=2, manual_grad=False)
+        try:
+            config, result = fem.solve()
+        except Exception:
+            # fallback to greedy matching if FEM fails
+            selected = []
+            for i, ((u, v), w) in enumerate(candidates):
+                selected.append(i)
+        else:
+            best_idx = int(torch.argmin(result).item())
+            chosen = config[best_idx].argmax(dim=1).cpu().numpy().astype(np.int64)
+            selected = [i for i, val in enumerate(chosen) if val == 1]
+
+        # Greedily apply non-conflicting contractions from selected set, highest weight first
+        selected_sorted = sorted(selected, key=lambda i: -weights[i])
+        used = [False] * current_n
+        remap = np.full(current_n + len(selected_sorted), -1, dtype=np.int64)
+        new_groups = []
+        new_id = 0
+
+        for i in selected_sorted:
+            u = vars_u[i]
+            v = vars_v[i]
+            if used[u] or used[v]:
+                continue
+            used[u] = True
+            used[v] = True
+            remap[u] = new_id
+            remap[v] = new_id
+            new_groups.append(current_groups[u] + current_groups[v])
+            new_id += 1
+
+        # remaining singletons
+        for u in range(current_n):
+            if not used[u]:
+                remap[u] = new_id
+                new_groups.append(current_groups[u])
+                new_id += 1
+
+        # rebuild hyperedges
+        new_hyperedges = []
+        for he in current_hyperedges:
+            mapped = []
+            seen = set()
+            for v in he:
+                nv = remap[v]
+                if nv < 0 or nv in seen:
                     continue
-                matched.add(u)
-                matched.add(v)
-                coarse_groups.append([u, v])
-                original_to_coarse[u] = next_c
-                original_to_coarse[v] = next_c
-                next_c += 1
+                mapped.append(int(nv))
+                seen.add(int(nv))
+            if len(mapped) > 1:
+                new_hyperedges.append(mapped)
 
-        for v in range(num_nodes):
-            if original_to_coarse[v] == -1:
-                coarse_groups.append([v])
-                original_to_coarse[v] = next_c
-                next_c += 1
+        if new_id == current_n:
+            break
 
-    lsh_map, lsh_groups = _lsh_bucketize_vertices(
-        hyperedges,
-        num_nodes,
-        target_buckets=max(1, int(coarsen_to) * 4),
-        num_planes=lsh_planes,
-        num_tables=lsh_tables,
-    )
-    coarse_groups = [list(g) for g in lsh_groups]
-    pre_hyperedges = _rebuild_hyperedges_from_groups(hyperedges, lsh_map, len(lsh_groups))
-    coarse_hyperedges = _build_coarse_hyperedges(pre_hyperedges, np.arange(len(lsh_groups), dtype=np.int64), len(lsh_groups))
+        current_groups = new_groups
+        current_hyperedges = new_hyperedges
+        current_n = new_id
+
+    # finalize outputs
+    coarse_groups = current_groups
+    original_to_coarse = np.empty(num_nodes, dtype=np.int64)
+    for idx, members in enumerate(coarse_groups):
+        for member in members:
+            if member < num_nodes:
+                original_to_coarse[member] = idx
+
+    coarse_hyperedges = _build_coarse_hyperedges(hyperedges, original_to_coarse, num_nodes)
     coarse_graph = build_clique_expanded_graph(coarse_hyperedges, num_nodes=len(coarse_groups), normalize_weight=True)
     coarse_node_weights = torch.tensor([len(g) for g in coarse_groups], dtype=torch.float32)
-
     initial_assignment = greedy_initial_hypergraph_partition(
         coarse_hyperedges,
-        len(coarse_groups),
+        coarse_node_weights.cpu().numpy(),
         q,
         hyperedge_weights=[1.0] * len(coarse_hyperedges),
+        epsilon=0.03,
         seed=None,
     )
     return {
