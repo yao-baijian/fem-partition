@@ -1,7 +1,9 @@
 import inspect
 import importlib
 import json
-res={}
+
+
+res = {}
 try:
     pymetis = importlib.import_module('pymetis')
     try:
@@ -12,4 +14,5 @@ try:
         res['pymetis_sig'] = f'<no signature: {e!r}>'
 except Exception as e:
     res['pymetis_error'] = str(e)
+
 print(json.dumps(res))

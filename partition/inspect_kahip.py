@@ -1,5 +1,7 @@
 import inspect
+
 import kahip
+
 try:
     s = inspect.signature(kahip.kaffpa)
 except Exception as e:

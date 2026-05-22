@@ -7,16 +7,19 @@ import numpy as np
 import warnings
 
 from utils import *
+from partition import coarsen_kahypar_like as shared_kahypar_like_coarsen
+from partition import coarsen_fem_refine_kahypar as shared_fem_matching_coarsen
+from partition.refine import hybrid_refine_partition
 
 try:
-    import kahypar
+    import kahypar  # type: ignore[import-not-found]
     HAS_KAHYPAR = True
 except ImportError:
     HAS_KAHYPAR = False
     warnings.warn("KaHyPar is not installed. Will fallback to FEM where applicable.")
 
 try:
-    import pymetis
+    import pymetis  # type: ignore[import-not-found]
     HAS_METIS = True
 except ImportError:
     HAS_METIS = False
@@ -28,7 +31,7 @@ except ImportError:
 num_trials = 1
 num_steps = 50
 dev = 'cpu'
-instance = '../partition/full_benchmark_set/as-caida.mtx.hgr'
+instance = '../partition/full_benchmark_set/powersim.mtx.hgr'
 
 # ==========================================
 # Select the partition method to run:
@@ -50,7 +53,7 @@ requested_method = partition_method
 if partition_method in ('pubo_q4_explicit', 'pubo_implicit', 'pubo_direct', 'pubo_coarsen'):
     q_ways = 4
 else:
-    q_ways = 2
+    q_ways = 4
 
 
 def build_coarse_hyperedges(hyperedges_list, original_to_coarse_map, node_count):
@@ -101,31 +104,30 @@ def make_q4_pubo_object(hyperedges_list, node_weights_list, cut_func, num_nodes_
     return _Q4PUBO()
 
 
-def run_kahypar_like_multilevel(clique_graph_local, hyperedges_local, num_nodes_local, q_local, coarsen_to=500):
-    coarse_graph_local, coarse_node_weights_local, coarse_groups_local, original_to_coarse_local = coarsen_graph_by_matching(
-        clique_graph_local,
-        node_weights=torch.ones(num_nodes_local, dtype=torch.float32),
-        coarsen_to=coarsen_to,
-    )
-
-    coarse_hyperedges_local = build_coarse_hyperedges(hyperedges_local, original_to_coarse_local, num_nodes_local)
-    initial_assignment_local = greedy_initial_hypergraph_partition(
-        coarse_hyperedges_local,
-        coarse_graph_local.shape[0],
-        q_local,
-        hyperedge_weights=[1.0] * len(coarse_hyperedges_local),
-        max_imbalance=0.05,
-    )
-    initial_assignment_local = greedy_refine_hypergraph(
-        initial_assignment_local,
-        coarse_hyperedges_local,
-        [1.0] * len(coarse_hyperedges_local),
+def run_kahypar_like_multilevel(clique_graph_local, hyperedges_local, num_nodes_local, q_local, coarsen_to=500, verbose=True):
+    stage_t0 = time.time()
+    res = shared_kahypar_like_coarsen(
+        hyperedges_local,
+        num_nodes_local,
         q=q_local,
-        max_passes=5,
-        max_imbalance=0.05,
+        coarsen_to=max(10, int(coarsen_to)),
+        verbose=verbose,
     )
+    if verbose:
+        print(
+            f"[kahyper_like] shared_kahypar_like_coarsen: "
+            f"n={num_nodes_local} -> {len(res['coarse_groups'])}, "
+            f"nnz={int(res['coarse_graph']._nnz()) if res['coarse_graph'].is_sparse else 0}, "
+            f"time={time.time() - stage_t0:.4f}s"
+        )
 
-    return coarse_graph_local, coarse_node_weights_local, coarse_groups_local, original_to_coarse_local, initial_assignment_local
+    return (
+        res['coarse_graph'],
+        res['coarse_node_weights'],
+        res['coarse_groups'],
+        res['original_to_coarse'],
+        res['initial_assignment'],
+    )
 
 print(f"Loading {instance}...")
 hyperedges = parse_hypergraph_edges(instance)
@@ -194,9 +196,29 @@ elif partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine'
             hyperedges,
             num_nodes,
             q_ways,
+            coarsen_to=50,
+            verbose=True,
         )
         num_coarse_nodes = coarse_graph.shape[0]
         print(f"KaHyPar-like coarse partitioning took: {time.time() - start_time:.4f} seconds")
+    elif partition_method == 'coarsen_fem_refine_kahypar':
+        shared_res = shared_fem_matching_coarsen(
+            hyperedges,
+            num_nodes,
+            q=q_ways,
+            coarsen_to=500,
+            num_trials=num_trials,
+            num_steps=num_steps,
+            dev=dev,
+            verbose=True,
+        )
+        coarse_graph = shared_res['coarse_graph']
+        coarse_node_weights = shared_res['coarse_node_weights']
+        coarse_groups = shared_res['coarse_groups']
+        original_to_coarse = shared_res['original_to_coarse']
+        initial_assignment = shared_res['initial_assignment']
+        num_coarse_nodes = coarse_graph.shape[0]
+        print(f"Shared FEM matching coarsening took: {time.time() - start_time:.4f} seconds")
     else:
         # Step 1: Multi-level coarsening
         coarse_graph, coarse_node_weights, coarse_groups, original_to_coarse = coarsen_graph_by_matching(
@@ -247,11 +269,6 @@ elif partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine'
         best_config = config[0]
         initial_assignment = best_config.argmax(dim=1).cpu().numpy()
         print(f"Coarse PUBO partitioning took: {time.time() - start_time:.4f} seconds")
-
-    if partition_method in ['coarsen_kahypar_refine', 'kahyper_like']:
-        print("Using self-implemented KaHyPar-like coarse solve (FEM) on the coarsened graph...")
-        # `initial_assignment` is already produced by run_kahypar_like_multilevel().
-        pass
 
     # -----------------------------
     # Option D: Explicit q=4 Formulations PUBO on Coarse Graph
@@ -423,7 +440,9 @@ else:
 # 3. Projection & Refinement
 if partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine', 'kahyper_like', 'pubo_coarsen', 'pubo_q4_explicit', 'pubo_implicit']:
     print("Step 3: Uncoarsening (Projection) back to original hypergraph...")
+    step3_t0 = time.time()
     group_assignment = expand_coarse_labels(coarse_groups, initial_assignment, num_nodes)
+    print(f"Step 3: expand_coarse_labels finished in {time.time() - step3_t0:.4f}s")
     
     # If KaHyPar was requested and is available, use it to refine the partition
     if requested_method == 'coarsen_kahypar_refine' and use_kahypar_refine:
@@ -450,15 +469,27 @@ if partition_method in ['coarsen_fem_refine_kahypar', 'coarsen_kahypar_refine', 
         kahypar.improvePartition(hg, ctx)
         final_assignment = [hg.blockID(i) for i in range(num_nodes)]
     else:
-        print("Step 3: Running Greedy Refinement (Local Swap)...")
-        final_assignment = greedy_refine_hypergraph(
-            group_assignment, 
-            hyperedges, 
-            [1.0] * len(hyperedges), 
-            q=q_ways, 
-            max_passes=5,
-            max_imbalance=0.05  # target imbalance <= 0.05 as requested
-        )
+        print("Step 3: Running Hybrid Refinement (Flow + MCTS + Evolution)...")
+        step3_refine_t0 = time.time()
+        if requested_method == 'kahyper_like' or requested_method == 'coarsen_fem_refine_kahypar':
+            final_assignment = hybrid_refine_partition(
+                group_assignment,
+                hyperedges,
+                mode_cycle=('flow', 'mcts', 'evolution'),
+                rounds=3,
+                q=q_ways,
+            )
+            print(f"Step 3: hybrid_refine_partition finished in {time.time() - step3_refine_t0:.4f}s")
+        else:
+            final_assignment = greedy_refine_hypergraph_incremental(
+                group_assignment,
+                hyperedges,
+                [1.0] * len(hyperedges),
+                q=q_ways,
+                max_passes=5,
+                max_imbalance=0.05  # target imbalance <= 0.05 as requested
+            )
+            print(f"Step 3: greedy_refine_hypergraph_incremental finished in {time.time() - step3_refine_t0:.4f}s")
 else:
     final_assignment = initial_assignment
 
@@ -467,6 +498,7 @@ fem_cut_value, _ = evaluate_kahypar_cut_value(final_assignment, hyperedges, [1.0
 counts = np.bincount(final_assignment, minlength=q_ways)
 ideal = num_nodes / q_ways
 max_imbalance = float(np.max(np.abs(counts - ideal) / ideal))
+print(f"Total runtime so far: {time.time() - start_time:.4f}s")
 
 print(f'\n--- Final Results ---')
 print(f'Instance: {instance}')

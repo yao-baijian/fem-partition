@@ -193,6 +193,167 @@ def coarsen_graph_by_matching(J: torch.Tensor, node_weights=None, max_node_weigh
     return current_J, coarse_node_weights, groups, original_to_coarse
 
 
+def coarsen_graph_n_level(
+    J: torch.Tensor,
+    node_weights=None,
+    max_node_weight=None,
+    coarsen_to: int = 500,
+    max_rounds: int = 1000,
+    verbose: bool = False,
+    log_every: int = 100,
+):
+    """
+    n-level style coarsening: merge only one vertex pair per level.
+
+    This intentionally creates many fine-grained levels so uncoarsening can
+    remain cheap and local, similar to the high-level structure used by KaHyPar.
+    """
+    if not J.is_sparse:
+        J = J.to_sparse()
+    J = J.coalesce()
+    n = J.shape[0]
+
+    if n == 0:
+        empty_w = torch.empty((0,), dtype=torch.float32)
+        return J, empty_w, [], np.empty((0,), dtype=np.int64)
+
+    if node_weights is None:
+        weights = np.ones(n, dtype=np.float32)
+    else:
+        weights = np.array(node_weights, dtype=np.float32)
+
+    if max_node_weight is None:
+        max_node_weight = max(weights.sum() / 50.0, np.max(weights) * 2)
+
+    groups = [[node] for node in range(n)]
+    current_J = J
+    current_weights = weights
+    current_n = n
+
+    # Build an adjacency dict for fast updates and a candidate heap (max-heap via negative weights).
+    import heapq
+
+    adjacency = _sparse_to_adjacency_dict(current_J)
+    alive = np.ones(current_n, dtype=bool)
+    # Use lists for weights/groups that will be mutated in place.
+    weights = list(current_weights.tolist())
+
+    heap = []  # entries are (-edge_w, u, v)
+    for u, nbrs in enumerate(adjacency):
+        for v, edge_w in nbrs.items():
+            if u < v and weights[u] + weights[v] <= max_node_weight:
+                heapq.heappush(heap, (-float(edge_w), u, v))
+
+    merges_done = 0
+    while merges_done < max_rounds:
+        # stop when target reached
+        if sum(alive) <= coarsen_to:
+            break
+
+        # find a valid candidate
+        best_pair = None
+        while heap:
+            neg_w, u, v = heapq.heappop(heap)
+            if not (alive[u] and alive[v]):
+                continue
+            # validate current edge weight still exists and weight constraints
+            cur_w = adjacency[u].get(v, 0.0)
+            if cur_w <= 0.0:
+                continue
+            if weights[u] + weights[v] > max_node_weight:
+                continue
+            best_pair = (u, v, float(cur_w))
+            break
+
+        if best_pair is None:
+            break
+
+        u, v, w = best_pair
+
+        # merge v into u (choose smaller id as representative for stability)
+        if v < u:
+            u, v = v, u
+
+        # combine groups and weights
+        groups[u] = groups[u] + groups[v]
+        weights[u] = float(weights[u]) + float(weights[v])
+        alive[v] = False
+
+        # Merge adjacency of v into u
+        for x, wvx in list(adjacency[v].items()):
+            if x == u:
+                continue
+            # add weight to u-x
+            adjacency[u][x] = adjacency[u].get(x, 0.0) + float(wvx)
+            # replace v with u in x's adjacency
+            adjacency[x][u] = adjacency[x].get(u, 0.0) + float(adjacency[x].pop(v, 0.0))
+
+        # remove self-loops if any
+        adjacency[u].pop(u, None)
+        adjacency[v].clear()
+
+        # push new candidate edges for updated u
+        for nbr, ew in adjacency[u].items():
+            if alive[nbr] and weights[u] + weights[nbr] <= max_node_weight:
+                heapq.heappush(heap, (-float(ew), min(u, nbr), max(u, nbr)))
+
+        merges_done += 1
+
+        if verbose and (merges_done % max(1, int(log_every)) == 0):
+            print(f"[coarsen_n_level] merges={merges_done}, alive={int(sum(alive))}")
+
+    # compact remaining alive nodes to build the coarse sparse tensor
+    old_to_new = np.full(current_n, -1, dtype=np.int64)
+    new_groups = []
+    new_weights = []
+    next_idx = 0
+    for i in range(current_n):
+        if not alive[i]:
+            continue
+        old_to_new[i] = next_idx
+        new_groups.append(groups[i])
+        new_weights.append(weights[i])
+        next_idx += 1
+
+    if next_idx == 0:
+        current_J = torch.sparse_coo_tensor(torch.empty((2, 0), dtype=torch.long), torch.empty((0,), dtype=torch.float32), (0, 0)).coalesce()
+    else:
+        rows = []
+        cols = []
+        vals = []
+        for u in range(current_n):
+            if old_to_new[u] == -1:
+                continue
+            for v, ew in adjacency[u].items():
+                if old_to_new[v] == -1:
+                    continue
+                r = old_to_new[u]
+                c = old_to_new[v]
+                if r != c:
+                    rows.append(r)
+                    cols.append(c)
+                    vals.append(float(ew))
+
+        if rows:
+            indices = torch.tensor([rows, cols], dtype=torch.long)
+            values = torch.tensor(vals, dtype=torch.float32)
+            current_J = torch.sparse_coo_tensor(indices, values, (next_idx, next_idx)).coalesce()
+        else:
+            current_J = torch.sparse_coo_tensor(torch.empty((2, 0), dtype=torch.long), torch.empty((0,), dtype=torch.float32), (next_idx, next_idx)).coalesce()
+
+    current_weights = np.array(new_weights, dtype=np.float32)
+    groups = new_groups
+    current_n = next_idx
+
+    coarse_node_weights = torch.tensor(current_weights, dtype=torch.float32)
+    original_to_coarse = np.empty(n, dtype=np.int64)
+    for c_node, members in enumerate(groups):
+        for member in members:
+            original_to_coarse[member] = c_node
+
+    return current_J, coarse_node_weights, groups, original_to_coarse
+
+
 def expand_coarse_labels(coarse_groups: list, coarse_labels: np.ndarray, num_nodes: int):
     labels = np.empty(num_nodes, dtype=np.int64)
     for coarse_node, members in enumerate(coarse_groups):
@@ -398,6 +559,118 @@ def greedy_refine_hypergraph(
         if not moved_any:
             break
             
+    return assignment
+
+
+def greedy_refine_hypergraph_incremental(
+    assignment: np.ndarray,
+    hyperedges: list,
+    hyperedge_weights: list,
+    q: int,
+    max_passes: int = 5,
+    max_imbalance: float = 0.05,
+):
+    """
+    Incremental local refinement that only re-evaluates affected vertices
+    (the moved vertex and its L1 hypergraph neighbors).
+    """
+    assignment = assignment.copy()
+    num_nodes = len(assignment)
+
+    if hyperedge_weights is None:
+        hyperedge_weights = [1.0] * len(hyperedges)
+
+    he_pins = [np.zeros(q, dtype=np.int32) for _ in range(len(hyperedges))]
+    node_to_he = [[] for _ in range(num_nodes)]
+    vertex_neighbors = [set() for _ in range(num_nodes)]
+
+    for e_idx, he in enumerate(hyperedges):
+        for v in he:
+            if v < num_nodes:
+                he_pins[e_idx][assignment[v]] += 1
+                node_to_he[v].append(e_idx)
+        for u in he:
+            if u < num_nodes:
+                for v in he:
+                    if u != v and v < num_nodes:
+                        vertex_neighbors[u].add(v)
+
+    group_sizes = np.bincount(assignment, minlength=q)
+    ideal_size = num_nodes / float(q)
+    max_size = ideal_size * (1.0 + max_imbalance)
+
+    active = np.zeros(num_nodes, dtype=bool)
+    queue = list(np.where(np.ones(num_nodes, dtype=bool))[0])
+
+    def move_gain(v, new_group):
+        old_group = assignment[v]
+        if new_group == old_group:
+            return 0.0
+        gain = 0.0
+        for e_idx in node_to_he[v]:
+            pins = he_pins[e_idx]
+            weight = hyperedge_weights[e_idx]
+            if pins[old_group] == 1:
+                gain += weight
+            if pins[new_group] == 0:
+                gain -= weight
+        return gain
+
+    for _pass in range(max_passes):
+        moved_any = False
+        # Only revisit vertices that are active or whose neighbors were affected.
+        while queue:
+            v = queue.pop()
+            active[v] = False
+
+            old_group = assignment[v]
+            best_gain = 0.0
+            best_group = old_group
+
+            for new_group in range(q):
+                if new_group == old_group:
+                    continue
+                if group_sizes[new_group] + 1 > max_size:
+                    continue
+                gain = move_gain(v, new_group)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_group = new_group
+
+            if best_group != old_group:
+                assignment[v] = best_group
+                group_sizes[old_group] -= 1
+                group_sizes[best_group] += 1
+
+                for e_idx in node_to_he[v]:
+                    he_pins[e_idx][old_group] -= 1
+                    he_pins[e_idx][best_group] += 1
+
+                moved_any = True
+
+                affected = set(vertex_neighbors[v])
+                affected.add(v)
+                for u in affected:
+                    if not active[u]:
+                        queue.append(u)
+                        active[u] = True
+
+        if not moved_any:
+            break
+
+        # Re-seed the frontier for the next pass with boundary vertices only.
+        frontier = set()
+        for v in range(num_nodes):
+            for e_idx in node_to_he[v]:
+                pins = he_pins[e_idx]
+                if pins[assignment[v]] == 1:
+                    frontier.add(v)
+                    frontier.update(vertex_neighbors[v])
+                    break
+        queue = list(frontier)
+        for v in queue:
+            active[v] = True
+
     return assignment
 
 
