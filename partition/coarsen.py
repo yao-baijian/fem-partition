@@ -475,15 +475,67 @@ def coarsen_kahypar_like(hyperedges, num_nodes, q=2, coarsen_to=10, verbose=Fals
     }
 
 
-def coarsen_fem_refine_kahypar(hyperedges, num_nodes, q=2, coarsen_to=10, num_trials=1, num_steps=10, dev='cpu', verbose=False, lsh_planes=4, lsh_tables=32):
-    """Edge-variable QUBO coarsening (reverted implementation).
+def coarsen_fem_refine_kahypar(
+    hyperedges,
+    num_nodes,
+    q=2,
+    coarsen_to=10,
+    num_trials=1,
+    num_steps=10,
+    dev='cpu',
+    verbose=False,
+    lsh_planes=4,
+    lsh_tables=32,
+    fem_mode='fem_as_hem',
+):
+    """FEM-assisted coarsening with two submodes.
 
-    Build candidate contraction edges from hyperedges, form a sparse
-    QUBO over edge-selection variables, solve with FEM.customize and
-    greedily apply non-conflicting selected contractions in batches until
-    target `coarsen_to` is reached. This avoids building dense NxN matrices.
+    fem_as_hem:
+        Use a sparse edge-variable QUBO to replace the HEM contraction step.
+    fem_as_greedy_init:
+        Use the normal KaHyPar-like coarsening pipeline, then replace the
+        initial greedy coarse partition with a FEM-based initial partition.
     """
     from FEM import FEM as _FEM
+
+    if fem_mode not in ('fem_as_hem', 'fem_as_greedy_init'):
+        raise ValueError(f"Unknown fem_mode: {fem_mode}")
+
+    def _fem_initial_partition(coarse_graph, coarse_node_weights):
+        coarse_coupling = coarse_graph
+        if not coarse_coupling.is_sparse:
+            coarse_coupling = coarse_coupling.to_sparse()
+        coarse_coupling = coarse_coupling.coalesce()
+
+        num_coarse_nodes = int(coarse_coupling.shape[0])
+        num_interactions = int(coarse_coupling._nnz() // 2)
+
+        fem = _FEM.from_couplings(
+            'bmincut',
+            num_coarse_nodes,
+            num_interactions,
+            coarse_coupling,
+            node_weights=coarse_node_weights,
+        )
+        fem.set_up_solver(num_trials, num_steps, dev=dev, q=max(2, int(q)))
+        configs, results = fem.solve()
+        best_idx = int(torch.argmin(results).item())
+        return configs[best_idx].argmax(dim=1).cpu().numpy().astype(np.int64)
+
+    if fem_mode == 'fem_as_greedy_init':
+        res = coarsen_kahypar_like(
+            hyperedges,
+            num_nodes,
+            q=q,
+            coarsen_to=coarsen_to,
+            verbose=verbose,
+            seed=0,
+            lsh_planes=lsh_planes,
+            lsh_tables=lsh_tables,
+            use_lsh=False,
+        )
+        res['initial_assignment'] = _fem_initial_partition(res['coarse_graph'], res['coarse_node_weights'])
+        return res
 
     rng = np.random.default_rng(0)
     target_coarse = max(1, int(coarsen_to))
@@ -613,7 +665,7 @@ def coarsen_fem_refine_kahypar(hyperedges, num_nodes, q=2, coarsen_to=10, num_tr
 
         fem = _FEM()
         dummy = torch.zeros((m, m), dtype=torch.float32)
-        fem.set_up_problem(m, 0, 'customize', dummy, q=2, customize_expected_func=expected_qubo, customize_infer_func=inference_qubo)
+        fem.set_up_problem(m, 0, 'customize', dummy, customize_expected_func=expected_qubo, customize_infer_func=inference_qubo)
         fem.set_up_solver(max(1, num_trials), max(10, num_steps), anneal='lin', dev=dev, q=2, manual_grad=False)
         try:
             config, result = fem.solve()
